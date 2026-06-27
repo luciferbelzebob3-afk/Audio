@@ -1,0 +1,6 @@
+{
+  "name": "Beat & Vocal Studio",
+  "description": "Profesionální studio pro detekci BPM beatů, úpravu rapových vokálů (normalizace, komprese, EQ, de-esser, limiter atd.) a automatické míchání vokálů s beatem.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
