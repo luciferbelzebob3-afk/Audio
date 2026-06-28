@@ -41,8 +41,11 @@ jobs:
       - name: Create Configuration Files
         run: |
           touch local.properties
-          touch .env
-          echo "MAPS_API_KEY=" > .env
+          if [ -f .env.example ]; then
+            cp .env.example .env
+          else
+            echo "GEMINI_API_KEY=dummy_key" > .env
+          fi
 
       - name: Build Debug APK
         run: |
