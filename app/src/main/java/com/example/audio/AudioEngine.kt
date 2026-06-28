@@ -27,6 +27,52 @@ object AudioEngine {
         VOCAL
     }
 
+    class WavData(val samples: ShortArray, val numChannels: Int, val sampleRate: Int, val bitsPerSample: Int)
+
+    fun parseWavPCM(file: File): WavData? {
+        try {
+            val bytes = file.readBytes()
+            if (bytes.size < 44) return null
+            
+            // Find "data" chunk
+            var offset = 12 // skip RIFF + size + WAVE
+            var numChannels = 2
+            var sampleRate = 44100
+            var bitsPerSample = 16
+            
+            while (offset + 8 <= bytes.size) {
+                val chunkId = String(bytes, offset, 4, java.nio.charset.StandardCharsets.US_ASCII)
+                val chunkSize = ByteBuffer.wrap(bytes, offset + 4, 4).order(ByteOrder.LITTLE_ENDIAN).int
+                
+                if (chunkId == "fmt ") {
+                    numChannels = ByteBuffer.wrap(bytes, offset + 8 + 2, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt()
+                    sampleRate = ByteBuffer.wrap(bytes, offset + 8 + 4, 4).order(ByteOrder.LITTLE_ENDIAN).int
+                    bitsPerSample = ByteBuffer.wrap(bytes, offset + 8 + 14, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt()
+                } else if (chunkId == "data") {
+                    val dataOffset = offset + 8
+                    val dataSize = min(chunkSize, bytes.size - dataOffset)
+                    if (dataSize <= 0) return null
+                    
+                    val shortBuffer = ShortArray(dataSize / 2)
+                    ByteBuffer.wrap(bytes, dataOffset, dataSize).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(shortBuffer)
+                    
+                    return WavData(shortBuffer, numChannels, sampleRate, bitsPerSample)
+                }
+                offset += 8 + chunkSize
+            }
+            
+            // Fallback if not found or malformed: assume 44-byte header
+            val dataSize = bytes.size - 44
+            if (dataSize <= 0) return null
+            val shortBuffer = ShortArray(dataSize / 2)
+            ByteBuffer.wrap(bytes, 44, dataSize).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(shortBuffer)
+            return WavData(shortBuffer, 2, 44100, 16)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error parsing WAV file $file", e)
+            return null
+        }
+    }
+
     /**
      * Synthesizes a high-quality test Beat WAV file (90 BPM)
      */
@@ -272,135 +318,120 @@ object AudioEngine {
      */
     fun detectBPM(file: File): Double {
         try {
-            FileInputStream(file).use { fis ->
-                val header = ByteArray(44)
-                if (fis.read(header) != 44) return 90.0
+            val wavData = parseWavPCM(file) ?: return 90.0
+            val samples = wavData.samples
+            val channels = wavData.numChannels
+            val sampleRate = wavData.sampleRate
 
-                val channels = ByteBuffer.wrap(header, 22, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt()
-                val sampleRate = ByteBuffer.wrap(header, 24, 4).order(ByteOrder.LITTLE_ENDIAN).int
-                val bitsPerSample = ByteBuffer.wrap(header, 34, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt()
+            if (sampleRate <= 0 || channels <= 0) return 90.0
 
-                if (sampleRate <= 0 || channels <= 0) return 90.0
+            val samplesPerSec = sampleRate * channels
+            val skipSamples = samplesPerSec * 3 // Skip first 3 seconds
+            
+            val startSampleOffset = if (samples.size > skipSamples + samplesPerSec * 8) {
+                skipSamples
+            } else {
+                0
+            }
+            
+            val secondsToAnalyze = 10
+            val samplesToAnalyze = min(samples.size - startSampleOffset, samplesPerSec * secondsToAnalyze)
+            if (samplesToAnalyze <= 1000) return 90.0
 
-                // Skip the first 3 seconds to avoid intro silence
-                val bytesPerSec = sampleRate * channels * (bitsPerSample / 8)
-                val skipBytes = bytesPerSec * 3L
-                val fileSize = file.length()
-                if (fileSize > skipBytes + bytesPerSec * 8) {
-                    fis.skip(skipBytes)
+            // Convert samples to mono float samples (-1.0 to 1.0)
+            val totalFrames = samplesToAnalyze / channels
+            val monoSamples = FloatArray(totalFrames)
+
+            for (f in 0 until totalFrames) {
+                var sum = 0.0f
+                for (c in 0 until channels) {
+                    sum += samples[startSampleOffset + f * channels + c].toFloat() / 32768.0f
                 }
+                monoSamples[f] = sum / channels
+            }
 
-                // Read 10 seconds of audio data
-                val secondsToAnalyze = 10
-                val bytesToRead = (bytesPerSec * secondsToAnalyze).toInt()
-                val pcmBytes = ByteArray(bytesToRead)
-                val readBytes = fis.read(pcmBytes)
-                if (readBytes <= 2000) return 90.0
+            // Now compute energy envelope in windows of 1024 samples (approx 23ms at 44.1kHz)
+            val windowSize = 1024
+            val numWindows = monoSamples.size / windowSize
+            if (numWindows < 10) return 90.0
+            val energies = DoubleArray(numWindows)
 
-                // Convert bytes to mono float samples (-1.0 to 1.0)
-                val bytesPerFrame = channels * (bitsPerSample / 8)
-                val totalFrames = readBytes / bytesPerFrame
-                val monoSamples = FloatArray(totalFrames)
+            for (w in 0 until numWindows) {
+                var sum = 0.0
+                for (s in 0 until windowSize) {
+                    val idx = w * windowSize + s
+                    val amp = monoSamples[idx].toDouble()
+                    sum += amp * amp
+                }
+                energies[w] = sum / windowSize
+            }
 
-                val buffer = ByteBuffer.wrap(pcmBytes, 0, totalFrames * bytesPerFrame).order(ByteOrder.LITTLE_ENDIAN)
-                
-                for (f in 0 until totalFrames) {
-                    var sum = 0.0f
-                    for (c in 0 until channels) {
-                        val sampleVal = if (bitsPerSample == 16) {
-                            buffer.short.toFloat() / 32768.0f
-                        } else {
-                            // 8-bit fallback
-                            (buffer.get().toInt() and 0xFF - 128).toFloat() / 128.0f
+            // Smooth energies
+            val smoothed = DoubleArray(numWindows)
+            for (w in 1 until numWindows - 1) {
+                smoothed[w] = (energies[w-1] + energies[w] + energies[w+1]) / 3.0
+            }
+
+            // Peak/Onset detection using dynamic thresholding
+            val peakIndices = mutableListOf<Int>()
+            val thresholdMultiplier = 1.25
+            for (w in 8 until numWindows - 8) {
+                var localSum = 0.0
+                for (offset in -8..8) {
+                    localSum += smoothed[w + offset]
+                }
+                val localAvgEnergy = localSum / 17.0
+
+                if (smoothed[w] > localAvgEnergy * thresholdMultiplier &&
+                    smoothed[w] > smoothed[w - 1] && smoothed[w] > smoothed[w + 1]
+                ) {
+                    peakIndices.add(w)
+                }
+            }
+
+            if (peakIndices.size >= 3) {
+                // Collect all reasonable peak intervals (representing beat/sub-beat durations)
+                val intervals = mutableListOf<Int>()
+                for (i in 0 until peakIndices.size - 1) {
+                    for (j in i + 1 until min(peakIndices.size, i + 5)) { // look at immediate neighbors
+                        val diff = peakIndices[j] - peakIndices[i]
+                        if (diff in 10..65) {
+                            intervals.add(diff)
                         }
-                        sum += sampleVal
-                    }
-                    monoSamples[f] = sum / channels
-                }
-
-                // Now compute energy envelope in windows of 1024 samples (approx 23ms at 44.1kHz)
-                val windowSize = 1024
-                val numWindows = monoSamples.size / windowSize
-                if (numWindows < 10) return 90.0
-                val energies = DoubleArray(numWindows)
-
-                for (w in 0 until numWindows) {
-                    var sum = 0.0
-                    for (s in 0 until windowSize) {
-                        val idx = w * windowSize + s
-                        val amp = monoSamples[idx].toDouble()
-                        sum += amp * amp
-                    }
-                    energies[w] = sum / windowSize
-                }
-
-                // Smooth energies
-                val smoothed = DoubleArray(numWindows)
-                for (w in 1 until numWindows - 1) {
-                    smoothed[w] = (energies[w-1] + energies[w] + energies[w+1]) / 3.0
-                }
-
-                // Peak/Onset detection using dynamic thresholding
-                val peakIndices = mutableListOf<Int>()
-                val thresholdMultiplier = 1.25
-                for (w in 8 until numWindows - 8) {
-                    var localSum = 0.0
-                    for (offset in -8..8) {
-                        localSum += smoothed[w + offset]
-                    }
-                    val localAvgEnergy = localSum / 17.0
-
-                    if (smoothed[w] > localAvgEnergy * thresholdMultiplier &&
-                        smoothed[w] > smoothed[w - 1] && smoothed[w] > smoothed[w + 1]
-                    ) {
-                        peakIndices.add(w)
                     }
                 }
 
-                if (peakIndices.size >= 3) {
-                    // Collect all reasonable peak intervals (representing beat/sub-beat durations)
-                    val intervals = mutableListOf<Int>()
-                    for (i in 0 until peakIndices.size - 1) {
-                        for (j in i + 1 until min(peakIndices.size, i + 5)) { // look at immediate neighbors
-                            val diff = peakIndices[j] - peakIndices[i]
-                            if (diff in 10..65) {
-                                intervals.add(diff)
-                            }
+                if (intervals.isNotEmpty()) {
+                    // Find the most frequent interval (mode) using a histogram bucket
+                    val histogram = IntArray(100)
+                    for (interval in intervals) {
+                        if (interval in histogram.indices) {
+                            histogram[interval]++
+                            if (interval + 1 in histogram.indices) histogram[interval + 1]++
+                            if (interval - 1 in histogram.indices) histogram[interval - 1]++
                         }
                     }
 
-                    if (intervals.isNotEmpty()) {
-                        // Find the most frequent interval (mode) using a histogram bucket
-                        val histogram = IntArray(100)
-                        for (interval in intervals) {
-                            if (interval in histogram.indices) {
-                                histogram[interval]++
-                                if (interval + 1 in histogram.indices) histogram[interval + 1]++
-                                if (interval - 1 in histogram.indices) histogram[interval - 1]++
-                            }
+                    var bestInterval = 0
+                    var maxCount = -1
+                    for (i in histogram.indices) {
+                        if (histogram[i] > maxCount) {
+                            maxCount = histogram[i]
+                            bestInterval = i
                         }
+                    }
 
-                        var bestInterval = 0
-                        var maxCount = -1
-                        for (i in histogram.indices) {
-                            if (histogram[i] > maxCount) {
-                                maxCount = histogram[i]
-                                bestInterval = i
-                            }
-                        }
+                    if (bestInterval > 0) {
+                        val intervalSec = bestInterval * (windowSize.toDouble() / sampleRate)
+                        val detectedBpm = 60.0 / intervalSec
 
-                        if (bestInterval > 0) {
-                            val intervalSec = bestInterval * (windowSize.toDouble() / sampleRate)
-                            val detectedBpm = 60.0 / intervalSec
+                        // Standardize BPM within common musical ranges (70 to 145 BPM)
+                        var finalBpm = detectedBpm
+                        while (finalBpm < 70.0) finalBpm *= 2.0
+                        while (finalBpm > 145.0) finalBpm /= 2.0
 
-                            // Standardize BPM within common musical ranges (70 to 145 BPM)
-                            var finalBpm = detectedBpm
-                            while (finalBpm < 70.0) finalBpm *= 2.0
-                            while (finalBpm > 145.0) finalBpm /= 2.0
-
-                            // Round to nearest integer BPM for cleanliness
-                            return Math.round(finalBpm).toDouble()
-                        }
+                        // Round to nearest integer BPM for cleanliness
+                        return Math.round(finalBpm).toDouble()
                     }
                 }
             }
@@ -419,32 +450,18 @@ object AudioEngine {
         settings: VocalFileEntity
     ): Boolean {
         try {
-            val fis = FileInputStream(inputFile)
-            val header = ByteArray(44)
-            if (fis.read(header) != 44) {
-                fis.close()
-                return false
-            }
-
-            // Get total audio size
-            val dataSize = fis.channel.size() - 44
-            val samplesCount = (dataSize / 2).toInt()
-            val shortBuffer = ShortArray(samplesCount)
-
-            val fileData = ByteArray(dataSize.toInt())
-            var bytesRead = 0
-            while (bytesRead < fileData.size) {
-                val read = fis.read(fileData, bytesRead, fileData.size - bytesRead)
-                if (read == -1) break
-                bytesRead += read
-            }
-            fis.close()
-
-            ByteBuffer.wrap(fileData).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(shortBuffer)
-
-            // Convert to Float array (-1.0 to 1.0)
-            var floatSamples = FloatArray(shortBuffer.size) { i ->
-                shortBuffer[i].toFloat() / 32768.0f
+            val wavData = parseWavPCM(inputFile) ?: return false
+            val shortBuffer = wavData.samples
+            
+            // Convert to Float array (-1.0 to 1.0) and downmix stereo to mono if needed
+            var floatSamples = if (wavData.numChannels == 2) {
+                FloatArray(shortBuffer.size / 2) { i ->
+                    (shortBuffer[i * 2].toFloat() + shortBuffer[i * 2 + 1].toFloat()) / 65536.0f
+                }
+            } else {
+                FloatArray(shortBuffer.size) { i ->
+                    shortBuffer[i].toFloat() / 32768.0f
+                }
             }
 
             // === 1. ODSTRANĚNÍ HLUKU / BRUMU (De-hum Notch Filter) ===
@@ -697,27 +714,11 @@ object AudioEngine {
         outputFile: File
     ): Boolean {
         try {
-            // Read Beat WAV file
-            val beatFis = FileInputStream(beatFile)
-            val beatHeader = ByteArray(44)
-            if (beatFis.read(beatHeader) != 44) {
-                beatFis.close()
-                return false
-            }
-
-            val beatDataSize = beatFis.channel.size() - 44
-            val beatSamplesCount = (beatDataSize / 2).toInt()
-            val beatRawData = ByteArray(beatDataSize.toInt())
-            beatFis.read(beatRawData)
-            beatFis.close()
-
-            val beatShorts = ShortArray(beatSamplesCount)
-            ByteBuffer.wrap(beatRawData).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(beatShorts)
-
-            // Conver beat to float stereo
-            // If beat is mono, copy to L and R. If stereo, parse properly.
-            val beatChannels = ByteBuffer.wrap(beatHeader, 22, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt()
-            val numBeatStereoSamples = if (beatChannels == CHANNELS_STEREO) beatSamplesCount / 2 else beatSamplesCount
+            val beatWav = parseWavPCM(beatFile) ?: return false
+            val beatShorts = beatWav.samples
+            val beatChannels = beatWav.numChannels
+            
+            val numBeatStereoSamples = if (beatChannels == CHANNELS_STEREO) beatShorts.size / 2 else beatShorts.size
 
             val mixedL = FloatArray(numBeatStereoSamples)
             val mixedR = FloatArray(numBeatStereoSamples)
@@ -748,22 +749,10 @@ object AudioEngine {
             Log.d(TAG, "Applied automatic pocket carving EQ on instrumental beat (-3dB at 250Hz, -4.5dB at 1800Hz)")
 
             // Process and layer each vocal file onto the mixed buffer
-            // Let's identify "same-sounding" vocals to apply major/minor logic.
-            // Two vocal files are "same sounding" if they are loaded onto the same project
-            // and have similar lengths or content, or simply if they are designated as major/minor.
-            // If we have duplicates, we automatically delay and pan them to create the vocal double stack!
-            val parsedVocals = vocalFiles.map { (file, entity) ->
-                val vFis = FileInputStream(file)
-                val vHeader = ByteArray(44)
-                vFis.read(vHeader)
-                val vDataSize = vFis.channel.size() - 44
-                val vBytes = ByteArray(vDataSize.toInt())
-                vFis.read(vBytes)
-                vFis.close()
-
-                val vShorts = ShortArray((vDataSize / 2).toInt())
-                ByteBuffer.wrap(vBytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(vShorts)
-                val vChannels = ByteBuffer.wrap(vHeader, 22, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt()
+            val parsedVocals = vocalFiles.mapNotNull { (file, entity) ->
+                val vWav = parseWavPCM(file) ?: return@mapNotNull null
+                val vShorts = vWav.samples
+                val vChannels = vWav.numChannels
                 val vSamples = FloatArray(if (vChannels == CHANNELS_STEREO) vShorts.size / 2 else vShorts.size)
 
                 if (vChannels == CHANNELS_STEREO) {
@@ -779,7 +768,7 @@ object AudioEngine {
                 Triple(vSamples, entity, file.length())
             }
 
-            // Identify potential duplicates (vocal tracks with nearly identical file length +/- 200 bytes, or same size)
+            // Identify potential duplicates (vocal tracks with nearly identical file length +/- 1000 bytes)
             val isDuplicate = BooleanArray(parsedVocals.size)
             for (i in parsedVocals.indices) {
                 for (j in i + 1 until parsedVocals.size) {
