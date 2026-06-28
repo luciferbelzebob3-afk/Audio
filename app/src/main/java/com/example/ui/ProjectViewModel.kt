@@ -136,12 +136,12 @@ class ProjectViewModel(application: Application) : AndroidViewModel(application)
     }
 
     /**
-     * Imports an audio file picked from the device
+     * Imports an instrumental beat file and automatically detects its BPM
      */
-    fun importSelectedFile(projectId: Long, originalName: String, inputStream: InputStream) {
+    fun importBeatFile(projectId: Long, originalName: String, inputStream: InputStream) {
         viewModelScope.launch {
             _isLoading.value = true
-            _statusMessage.value = "Importuji a analyzuji soubor..."
+            _statusMessage.value = "Importuji a analyzuji instrumentální beat..."
 
             withContext(Dispatchers.IO) {
                 try {
@@ -149,51 +149,67 @@ class ProjectViewModel(application: Application) : AndroidViewModel(application)
                     val projectDir = getProjectDir(projectId)
                     if (!projectDir.exists()) projectDir.mkdirs()
 
-                    // Temporary copy to analyze
-                    val tempFile = File(projectDir, "temp_import_${System.currentTimeMillis()}.wav")
-                    FileOutputStream(tempFile).use { fos ->
+                    val finalBeatFile = File(projectDir, "${project.name}_BEAT.wav")
+                    if (finalBeatFile.exists()) finalBeatFile.delete()
+
+                    FileOutputStream(finalBeatFile).use { fos ->
                         inputStream.copyTo(fos)
                     }
 
-                    // Run the smart Audio Type Analyzer!
-                    val detectedType = AudioEngine.analyzeAudioType(tempFile)
-                    Log.d(TAG, "Import file $originalName analyzed type: $detectedType")
+                    _statusMessage.value = "Detekuji přesné BPM instrumentálu..."
+                    val detectedBpm = AudioEngine.detectBPM(finalBeatFile)
 
-                    if (detectedType == AudioEngine.AudioType.BEAT) {
-                        // This is a Beat track! Detect BPM and rename appropriately.
-                        _statusMessage.value = "Detekuji přesné BPM instrumentálu..."
-                        val detectedBpm = AudioEngine.detectBPM(tempFile)
+                    val updatedProject = project.copy(
+                        beatFilePath = finalBeatFile.absolutePath,
+                        beatOriginalName = originalName,
+                        bpm = detectedBpm
+                    )
+                    repository.updateProject(updatedProject)
+                    _currentProject.value = updatedProject
+                    _statusMessage.value = "Beat úspěšně nahrán! BPM detekováno: $detectedBpm"
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to import beat file", e)
+                    _statusMessage.value = "Chyba při importu beatu: ${e.message}"
+                } finally {
+                    _isLoading.value = false
+                }
+            }
+        }
+    }
 
-                        val finalBeatFile = File(projectDir, "${project.name}_BEAT.wav")
-                        if (finalBeatFile.exists()) finalBeatFile.delete()
-                        tempFile.renameTo(finalBeatFile)
+    /**
+     * Imports multiple vocal files selected from the device
+     */
+    fun importMultipleVocalFiles(projectId: Long, vocalStreams: List<Pair<String, InputStream>>) {
+        viewModelScope.launch {
+            _isLoading.value = true
+            _statusMessage.value = "Importuji ${vocalStreams.size} vokálních stop..."
 
-                        val updatedProject = project.copy(
-                            beatFilePath = finalBeatFile.absolutePath,
-                            beatOriginalName = originalName,
-                            bpm = detectedBpm
-                        )
-                        repository.updateProject(updatedProject)
-                        _currentProject.value = updatedProject
-                        _statusMessage.value = "Beat úspěšně nahrán! BPM detekováno: $detectedBpm"
-                    } else {
-                        // This is a Vocal track!
-                        // Determine the count of existing vocal tracks to label it (VOKAL1 - VOKAL99)
-                        val existingVocals = _vocals.value
-                        val vocalNumber = existingVocals.size + 1
-                        val assignedName = "${project.name}_VOKAL$vocalNumber"
+            withContext(Dispatchers.IO) {
+                try {
+                    val project = repository.getProjectById(projectId) ?: return@withContext
+                    val projectDir = getProjectDir(projectId)
+                    if (!projectDir.exists()) projectDir.mkdirs()
+
+                    var currentVocalNumber = _vocals.value.size
+
+                    for ((originalName, inputStream) in vocalStreams) {
+                        currentVocalNumber++
+                        val assignedName = "${project.name}_VOKAL$currentVocalNumber"
 
                         val finalVocalFile = File(projectDir, "$assignedName.wav")
                         if (finalVocalFile.exists()) finalVocalFile.delete()
-                        tempFile.renameTo(finalVocalFile)
 
-                        // If there is an existing vocal that sounds identical, set it up for dual-vocal major/minor stacking
+                        FileOutputStream(finalVocalFile).use { fos ->
+                            inputStream.copyTo(fos)
+                        }
+
+                        // Determine if major or minor double tracking
                         var setAsMajor = true
-                        if (existingVocals.isNotEmpty()) {
-                            // Check if length is similar or name indicates double
-                            val likelyDouble = originalName.lowercase().contains("double") || 
-                                              originalName.lowercase().contains("back") ||
-                                              vocalNumber > 1
+                        if (currentVocalNumber > 1) {
+                            val likelyDouble = originalName.lowercase().contains("double") ||
+                                               originalName.lowercase().contains("back") ||
+                                               currentVocalNumber > 1
                             if (likelyDouble) {
                                 setAsMajor = false
                             }
@@ -206,15 +222,16 @@ class ProjectViewModel(application: Application) : AndroidViewModel(application)
                             assignedName = assignedName,
                             isMajor = setAsMajor,
                             volume = if (setAsMajor) 1.0f else 0.65f,
-                            panning = if (setAsMajor) 0.0f else -0.75f // Panned wide left for backing minor double!
+                            panning = if (setAsMajor) 0.0f else -0.75f
                         )
 
                         repository.insertVocalFile(vocalEntity)
-                        _statusMessage.value = "Vokál nahrán a pojmenován jako: $assignedName"
                     }
+
+                    _statusMessage.value = "Úspěšně importováno ${vocalStreams.size} vokálních stop!"
                 } catch (e: Exception) {
-                    Log.e(TAG, "Failed to import selected audio file", e)
-                    _statusMessage.value = "Chyba při importu: ${e.message}"
+                    Log.e(TAG, "Failed to import vocals", e)
+                    _statusMessage.value = "Chyba při importu vokálů: ${e.message}"
                 } finally {
                     _isLoading.value = false
                 }

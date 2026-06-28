@@ -383,8 +383,8 @@ fun ProjectWorkspaceScreen(viewModel: ProjectViewModel, projectId: Long) {
     val playingPath by viewModel.playingPath.collectAsStateWithLifecycle()
     val context = LocalContext.current
 
-    // Launcher for file import
-    val fileLauncher = rememberLauncherForActivityResult(
+    // Launcher for Beat file import
+    val beatLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri ->
         uri?.let {
@@ -392,18 +392,47 @@ fun ProjectWorkspaceScreen(viewModel: ProjectViewModel, projectId: Long) {
                 val cr = context.contentResolver
                 val stream = cr.openInputStream(it)
                 if (stream != null) {
-                    var name = "import_audio.wav"
-                    // Try to get original file name
+                    var name = "import_beat.wav"
                     cr.query(it, null, null, null, null)?.use { cursor ->
                         val nameIndex = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
                         if (nameIndex != -1 && cursor.moveToFirst()) {
                             name = cursor.getString(nameIndex)
                         }
                     }
-                    viewModel.importSelectedFile(projectId, name, stream)
+                    viewModel.importBeatFile(projectId, name, stream)
                 }
             } catch (e: Exception) {
-                Log.e("UI", "File launcher error", e)
+                Log.e("UI", "Beat launcher error", e)
+            }
+        }
+    }
+
+    // Launcher for multiple Vocal files import at once
+    val vocalLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetMultipleContents()
+    ) { uris ->
+        if (uris.isNotEmpty()) {
+            val vocalsToImport = mutableListOf<Pair<String, java.io.InputStream>>()
+            for (uri in uris) {
+                try {
+                    val cr = context.contentResolver
+                    val stream = cr.openInputStream(uri)
+                    if (stream != null) {
+                        var name = "import_vocal.wav"
+                        cr.query(uri, null, null, null, null)?.use { cursor ->
+                            val nameIndex = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                            if (nameIndex != -1 && cursor.moveToFirst()) {
+                                name = cursor.getString(nameIndex)
+                            }
+                        }
+                        vocalsToImport.add(Pair(name, stream))
+                    }
+                } catch (e: Exception) {
+                    Log.e("UI", "Vocal launcher error for uri: $uri", e)
+                }
+            }
+            if (vocalsToImport.isNotEmpty()) {
+                viewModel.importMultipleVocalFiles(projectId, vocalsToImport)
             }
         }
     }
@@ -474,7 +503,7 @@ fun ProjectWorkspaceScreen(viewModel: ProjectViewModel, projectId: Long) {
                             fontWeight = FontWeight.Bold
                         )
                         if (activeProj.beatFilePath != null) {
-                            IconButton(onClick = { fileLauncher.launch("audio/*") }) {
+                            IconButton(onClick = { beatLauncher.launch("audio/*") }) {
                                 Icon(
                                     imageVector = Icons.Default.Refresh,
                                     contentDescription = "Změnit",
@@ -495,7 +524,7 @@ fun ProjectWorkspaceScreen(viewModel: ProjectViewModel, projectId: Long) {
                         Spacer(modifier = Modifier.height(12.dp))
                         Row(modifier = Modifier.fillMaxWidth()) {
                             Button(
-                                onClick = { fileLauncher.launch("audio/*") },
+                                onClick = { beatLauncher.launch("audio/*") },
                                 colors = ButtonDefaults.buttonColors(containerColor = StudioCyan, contentColor = Color.Black),
                                 shape = RoundedCornerShape(8.dp),
                                 modifier = Modifier
@@ -589,7 +618,7 @@ fun ProjectWorkspaceScreen(viewModel: ProjectViewModel, projectId: Long) {
                             fontWeight = FontWeight.Bold
                         )
                         IconButton(
-                            onClick = { fileLauncher.launch("audio/*") },
+                            onClick = { vocalLauncher.launch("audio/*") },
                             colors = IconButtonDefaults.iconButtonColors(contentColor = StudioCyan)
                         ) {
                             Icon(imageVector = Icons.Default.Add, contentDescription = "Přidat vokál")

@@ -223,88 +223,183 @@ object AudioEngine {
     }
 
     /**
+     * Helper Biquad Peak Filter (Bell EQ) used to automatically carve space in instrumental beats for vocals.
+     */
+    class BiquadPeakingEQ(frequency: Float, sampleRate: Float, q: Float, gainDb: Float) {
+        private val b0: Float
+        private val b1: Float
+        private val b2: Float
+        private val a1: Float
+        private val a2: Float
+
+        private var x1 = 0.0f
+        private var x2 = 0.0f
+        private var y1 = 0.0f
+        private var y2 = 0.0f
+
+        init {
+            val aVal = Math.pow(10.0, (gainDb / 40.0)).toFloat()
+            val w0 = (2.0f * Math.PI.toFloat() * frequency / sampleRate)
+            val alpha = (sin(w0.toDouble()).toFloat() / (2.0f * q))
+            val cosW0 = Math.cos(w0.toDouble()).toFloat()
+
+            val rawB0 = 1.0f + alpha * aVal
+            val rawB1 = -2.0f * cosW0
+            val rawB2 = 1.0f - alpha * aVal
+            val rawA0 = 1.0f + alpha / aVal
+            val rawA1 = -2.0f * cosW0
+            val rawA2 = 1.0f - alpha / aVal
+
+            b0 = rawB0 / rawA0
+            b1 = rawB1 / rawA0
+            b2 = rawB2 / rawA0
+            a1 = rawA1 / rawA0
+            a2 = rawA2 / rawA0
+        }
+
+        fun process(sample: Float): Float {
+            val y0 = b0 * sample + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
+            x2 = x1
+            x1 = sample
+            y2 = y1
+            y1 = y0
+            return y0
+        }
+    }
+
+    /**
      * Accurately detects the BPM of a beat track using transient-energy pulse peaks
      */
     fun detectBPM(file: File): Double {
         try {
             FileInputStream(file).use { fis ->
                 val header = ByteArray(44)
-                if (fis.read(header) == 44) {
-                    // Let's analyze about 3-5 seconds of audio to detect tempo
-                    val samplesToRead = 44100 * 5 // 5 seconds of 16-bit mono
-                    val pcmBytes = ByteArray(samplesToRead * 2)
-                    val readBytes = fis.read(pcmBytes)
-                    if (readBytes > 2000) {
-                        val samples = ShortArray(readBytes / 2)
-                        ByteBuffer.wrap(pcmBytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(samples)
+                if (fis.read(header) != 44) return 90.0
 
-                        // Calculate energy envelope in windows of 1024 samples (23.2ms)
-                        val windowSize = 1024
-                        val numWindows = samples.size / windowSize
-                        val energies = DoubleArray(numWindows)
+                val channels = ByteBuffer.wrap(header, 22, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt()
+                val sampleRate = ByteBuffer.wrap(header, 24, 4).order(ByteOrder.LITTLE_ENDIAN).int
+                val bitsPerSample = ByteBuffer.wrap(header, 34, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt()
 
-                        for (w in 0 until numWindows) {
-                            var sum = 0.0
-                            for (s in 0 until windowSize) {
-                                val idx = w * windowSize + s
-                                val amp = samples[idx].toDouble() / 32768.0
-                                sum += amp * amp
+                if (sampleRate <= 0 || channels <= 0) return 90.0
+
+                // Skip the first 3 seconds to avoid intro silence
+                val bytesPerSec = sampleRate * channels * (bitsPerSample / 8)
+                val skipBytes = bytesPerSec * 3L
+                val fileSize = file.length()
+                if (fileSize > skipBytes + bytesPerSec * 8) {
+                    fis.skip(skipBytes)
+                }
+
+                // Read 10 seconds of audio data
+                val secondsToAnalyze = 10
+                val bytesToRead = (bytesPerSec * secondsToAnalyze).toInt()
+                val pcmBytes = ByteArray(bytesToRead)
+                val readBytes = fis.read(pcmBytes)
+                if (readBytes <= 2000) return 90.0
+
+                // Convert bytes to mono float samples (-1.0 to 1.0)
+                val bytesPerFrame = channels * (bitsPerSample / 8)
+                val totalFrames = readBytes / bytesPerFrame
+                val monoSamples = FloatArray(totalFrames)
+
+                val buffer = ByteBuffer.wrap(pcmBytes, 0, totalFrames * bytesPerFrame).order(ByteOrder.LITTLE_ENDIAN)
+                
+                for (f in 0 until totalFrames) {
+                    var sum = 0.0f
+                    for (c in 0 until channels) {
+                        val sampleVal = if (bitsPerSample == 16) {
+                            buffer.short.toFloat() / 32768.0f
+                        } else {
+                            // 8-bit fallback
+                            (buffer.get().toInt() and 0xFF - 128).toFloat() / 128.0f
+                        }
+                        sum += sampleVal
+                    }
+                    monoSamples[f] = sum / channels
+                }
+
+                // Now compute energy envelope in windows of 1024 samples (approx 23ms at 44.1kHz)
+                val windowSize = 1024
+                val numWindows = monoSamples.size / windowSize
+                if (numWindows < 10) return 90.0
+                val energies = DoubleArray(numWindows)
+
+                for (w in 0 until numWindows) {
+                    var sum = 0.0
+                    for (s in 0 until windowSize) {
+                        val idx = w * windowSize + s
+                        val amp = monoSamples[idx].toDouble()
+                        sum += amp * amp
+                    }
+                    energies[w] = sum / windowSize
+                }
+
+                // Smooth energies
+                val smoothed = DoubleArray(numWindows)
+                for (w in 1 until numWindows - 1) {
+                    smoothed[w] = (energies[w-1] + energies[w] + energies[w+1]) / 3.0
+                }
+
+                // Peak/Onset detection using dynamic thresholding
+                val peakIndices = mutableListOf<Int>()
+                val thresholdMultiplier = 1.25
+                for (w in 8 until numWindows - 8) {
+                    var localSum = 0.0
+                    for (offset in -8..8) {
+                        localSum += smoothed[w + offset]
+                    }
+                    val localAvgEnergy = localSum / 17.0
+
+                    if (smoothed[w] > localAvgEnergy * thresholdMultiplier &&
+                        smoothed[w] > smoothed[w - 1] && smoothed[w] > smoothed[w + 1]
+                    ) {
+                        peakIndices.add(w)
+                    }
+                }
+
+                if (peakIndices.size >= 3) {
+                    // Collect all reasonable peak intervals (representing beat/sub-beat durations)
+                    val intervals = mutableListOf<Int>()
+                    for (i in 0 until peakIndices.size - 1) {
+                        for (j in i + 1 until min(peakIndices.size, i + 5)) { // look at immediate neighbors
+                            val diff = peakIndices[j] - peakIndices[i]
+                            if (diff in 10..65) {
+                                intervals.add(diff)
                             }
-                            energies[w] = sum / windowSize
+                        }
+                    }
+
+                    if (intervals.isNotEmpty()) {
+                        // Find the most frequent interval (mode) using a histogram bucket
+                        val histogram = IntArray(100)
+                        for (interval in intervals) {
+                            if (interval in histogram.indices) {
+                                histogram[interval]++
+                                if (interval + 1 in histogram.indices) histogram[interval + 1]++
+                                if (interval - 1 in histogram.indices) histogram[interval - 1]++
+                            }
                         }
 
-                        // Smooth energies with a simple running average
-                        val smoothed = DoubleArray(numWindows)
-                        for (w in 1 until numWindows - 1) {
-                            smoothed[w] = (energies[w-1] + energies[w] + energies[w+1]) / 3.0
-                        }
-
-                        // Detect peaks in energy (onsets)
-                        val peakIndices = mutableListOf<Int>()
-                        val thresholdMultiplier = 1.3
-                        var localAvgEnergy = 0.0
-                        for (w in 10 until numWindows - 10) {
-                            // Local average energy in sliding window of 20 frames
-                            var sum = 0.0
-                            for (offset in -10..10) {
-                                sum += smoothed[w + offset]
-                            }
-                            localAvgEnergy = sum / 21.0
-
-                            // Peak check
-                            if (smoothed[w] > localAvgEnergy * thresholdMultiplier &&
-                                smoothed[w] > smoothed[w - 1] && smoothed[w] > smoothed[w + 1]
-                            ) {
-                                peakIndices.add(w)
+                        var bestInterval = 0
+                        var maxCount = -1
+                        for (i in histogram.indices) {
+                            if (histogram[i] > maxCount) {
+                                maxCount = histogram[i]
+                                bestInterval = i
                             }
                         }
 
-                        // Calculate intervals between peaks in terms of windows
-                        if (peakIndices.size >= 2) {
-                            val intervals = mutableListOf<Int>()
-                            for (i in 0 until peakIndices.size - 1) {
-                                val diff = peakIndices[i+1] - peakIndices[i]
-                                if (diff > 10) { // Filter out extremely fast peaks
-                                    intervals.add(diff)
-                                }
-                            }
+                        if (bestInterval > 0) {
+                            val intervalSec = bestInterval * (windowSize.toDouble() / sampleRate)
+                            val detectedBpm = 60.0 / intervalSec
 
-                            if (intervals.isNotEmpty()) {
-                                // Group intervals to find the most common range (beat interval)
-                                val medianIntervalWindows = intervals.sorted()[intervals.size / 2]
-                                val intervalSec = medianIntervalWindows * (windowSize.toDouble() / SAMPLE_RATE)
-                                val detectedBpm = 60.0 / intervalSec
+                            // Standardize BPM within common musical ranges (70 to 145 BPM)
+                            var finalBpm = detectedBpm
+                            while (finalBpm < 70.0) finalBpm *= 2.0
+                            while (finalBpm > 145.0) finalBpm /= 2.0
 
-                                Log.d(TAG, "Detected intervals: $intervals, median windows: $medianIntervalWindows, interval: $intervalSec, BPM: $detectedBpm")
-
-                                // Standardize BPM within common ranges (60 to 180)
-                                var finalBpm = detectedBpm
-                                while (finalBpm < 65.0) finalBpm *= 2.0
-                                while (finalBpm > 150.0) finalBpm /= 2.0
-
-                                // Round to nearest 0.5 BPM
-                                return Math.round(finalBpm * 2.0) / 2.0
-                            }
+                            // Round to nearest integer BPM for cleanliness
+                            return Math.round(finalBpm).toDouble()
                         }
                     }
                 }
@@ -312,8 +407,6 @@ object AudioEngine {
         } catch (e: Exception) {
             Log.e(TAG, "Error during BPM detection", e)
         }
-
-        // Default fallbacks based on common rap tempo
         return 90.0
     }
 
@@ -641,6 +734,18 @@ object AudioEngine {
                     mixedR[i] = sample
                 }
             }
+
+            // Apply Auto-EQ on the Beat to carve out space for vocals (cuts at 250Hz for mud, 1800Hz for vocal pocket)
+            val beatEq1L = BiquadPeakingEQ(250f, SAMPLE_RATE.toFloat(), 1.0f, -3.0f)
+            val beatEq1R = BiquadPeakingEQ(250f, SAMPLE_RATE.toFloat(), 1.0f, -3.0f)
+            val beatEq2L = BiquadPeakingEQ(1800f, SAMPLE_RATE.toFloat(), 1.0f, -4.5f)
+            val beatEq2R = BiquadPeakingEQ(1800f, SAMPLE_RATE.toFloat(), 1.0f, -4.5f)
+
+            for (i in 0 until numBeatStereoSamples) {
+                mixedL[i] = beatEq2L.process(beatEq1L.process(mixedL[i]))
+                mixedR[i] = beatEq2R.process(beatEq1R.process(mixedR[i]))
+            }
+            Log.d(TAG, "Applied automatic pocket carving EQ on instrumental beat (-3dB at 250Hz, -4.5dB at 1800Hz)")
 
             // Process and layer each vocal file onto the mixed buffer
             // Let's identify "same-sounding" vocals to apply major/minor logic.
