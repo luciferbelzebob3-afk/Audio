@@ -20,7 +20,7 @@ abstract class ProjectDatabase : RoomDatabase() {
                     ProjectDatabase::class.java,
                     "rap_studio_database"
                 )
-                    .fallbackToDestructiveMigration()
+                    .fallbackToDestructiveMigration(true)
                     .build()
                 INSTANCE = instance
                 instance

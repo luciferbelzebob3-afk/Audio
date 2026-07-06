@@ -58,7 +58,10 @@ object AudioEngine {
                     
                     return WavData(shortBuffer, numChannels, sampleRate, bitsPerSample)
                 }
-                offset += 8 + chunkSize
+                
+                // WAV chunks are padded to even bytes
+                val paddedChunkSize = if (chunkSize % 2 != 0) chunkSize + 1 else chunkSize
+                offset += 8 + paddedChunkSize
             }
             
             // Fallback if not found or malformed: assume 44-byte header
@@ -69,6 +72,32 @@ object AudioEngine {
             return WavData(shortBuffer, 2, 44100, 16)
         } catch (e: Exception) {
             Log.e(TAG, "Error parsing WAV file $file", e)
+            return null
+        }
+    }
+
+    fun extractWaveform(file: File, numBars: Int): FloatArray? {
+        try {
+            val wavData = parseWavPCM(file) ?: return null
+            val samples = wavData.samples
+            if (samples.isEmpty()) return null
+
+            val bars = FloatArray(numBars)
+            val samplesPerBar = samples.size / numBars
+            if (samplesPerBar == 0) return bars
+
+            for (b in 0 until numBars) {
+                var maxAmp = 0f
+                val startIdx = b * samplesPerBar
+                val endIdx = min(samples.size, startIdx + samplesPerBar)
+                for (i in startIdx until endIdx) {
+                    maxAmp = max(maxAmp, abs(samples[i].toInt()).toFloat())
+                }
+                bars[b] = maxAmp / 32768.0f // Normalize to 0.0 - 1.0
+            }
+            return bars
+        } catch (e: Exception) {
+            Log.e(TAG, "Error extracting waveform", e)
             return null
         }
     }
@@ -864,22 +893,22 @@ object AudioEngine {
         val byteRate = SAMPLE_RATE * numChannels * 2
 
         val header = ByteArray(44)
-        header[0] = 'R'.toByte() // RIFF
-        header[1] = 'I'.toByte()
-        header[2] = 'F'.toByte()
-        header[3] = 'F'.toByte()
+        header[0] = 'R'.code.toByte() // RIFF
+        header[1] = 'I'.code.toByte()
+        header[2] = 'F'.code.toByte()
+        header[3] = 'F'.code.toByte()
         header[4] = (totalDataLen and 0xff).toByte() // file size - 8
         header[5] = ((totalDataLen shr 8) and 0xff).toByte()
         header[6] = ((totalDataLen shr 16) and 0xff).toByte()
         header[7] = ((totalDataLen shr 24) and 0xff).toByte()
-        header[8] = 'W'.toByte() // WAVE
-        header[9] = 'A'.toByte()
-        header[10] = 'V'.toByte()
-        header[11] = 'E'.toByte()
-        header[12] = 'f'.toByte() // fmt
-        header[13] = 'm'.toByte()
-        header[14] = 't'.toByte()
-        header[15] = ' '.toByte()
+        header[8] = 'W'.code.toByte() // WAVE
+        header[9] = 'A'.code.toByte()
+        header[10] = 'V'.code.toByte()
+        header[11] = 'E'.code.toByte()
+        header[12] = 'f'.code.toByte() // fmt
+        header[13] = 'm'.code.toByte()
+        header[14] = 't'.code.toByte()
+        header[15] = ' '.code.toByte()
         header[16] = 16 // size of fmt chunk
         header[17] = 0
         header[18] = 0
@@ -900,10 +929,10 @@ object AudioEngine {
         header[33] = 0
         header[34] = BITS_PER_SAMPLE_16.toByte() // 16 bits per sample
         header[35] = 0
-        header[36] = 'd'.toByte() // data chunk
-        header[37] = 'a'.toByte()
-        header[38] = 't'.toByte()
-        header[39] = 'a'.toByte()
+        header[36] = 'd'.code.toByte() // data chunk
+        header[37] = 'a'.code.toByte()
+        header[38] = 't'.code.toByte()
+        header[39] = 'a'.code.toByte()
         header[40] = (totalAudioLen and 0xff).toByte() // data size
         header[41] = ((totalAudioLen shr 8) and 0xff).toByte()
         header[42] = ((totalAudioLen shr 16) and 0xff).toByte()

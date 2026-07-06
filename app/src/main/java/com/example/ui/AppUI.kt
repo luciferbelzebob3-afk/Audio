@@ -4,6 +4,7 @@ import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -557,6 +558,11 @@ fun ProjectWorkspaceScreen(viewModel: ProjectViewModel, projectId: Long) {
                     } else {
                         // Beat Loaded State
                         val file = File(activeProj.beatFilePath!!)
+                        LaunchedEffect(activeProj.beatFilePath) {
+                            viewModel.loadWaveform(activeProj.beatFilePath!!)
+                        }
+                        val waveformData = viewModel.waveformState.collectAsState().value[activeProj.beatFilePath!!]
+
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -583,11 +589,52 @@ fun ProjectWorkspaceScreen(viewModel: ProjectViewModel, projectId: Long) {
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
                                 )
-                                Text(
-                                    text = "Detekované BPM: ${activeProj.bpm}",
-                                    color = StudioCyan,
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.SemiBold
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    var isEditingBpm by remember { mutableStateOf(false) }
+                                    var bpmText by remember(activeProj.bpm) { mutableStateOf(activeProj.bpm.toString()) }
+                                    
+                                    if (isEditingBpm) {
+                                        TextField(
+                                            value = bpmText,
+                                            onValueChange = { bpmText = it },
+                                            modifier = Modifier.width(100.dp).height(48.dp),
+                                            textStyle = androidx.compose.ui.text.TextStyle(color = Color.White, fontSize = 12.sp),
+                                            colors = TextFieldDefaults.colors(
+                                                unfocusedContainerColor = StudioDarkBg,
+                                                focusedContainerColor = StudioDarkBg,
+                                                focusedIndicatorColor = StudioGreen,
+                                                unfocusedIndicatorColor = StudioBorder
+                                            ),
+                                            singleLine = true
+                                        )
+                                        IconButton(onClick = { 
+                                            isEditingBpm = false
+                                            val newBpm = bpmText.toDoubleOrNull()
+                                            if (newBpm != null) {
+                                                viewModel.updateProjectBpm(activeProj.id, newBpm)
+                                            }
+                                        }, modifier = Modifier.size(32.dp)) {
+                                            Icon(Icons.Default.Check, "Save BPM", tint = StudioGreen, modifier = Modifier.size(16.dp))
+                                        }
+                                    } else {
+                                        Text(
+                                            text = "Detekované BPM: ${activeProj.bpm}",
+                                            color = StudioCyan,
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.SemiBold
+                                        )
+                                        IconButton(onClick = { isEditingBpm = true }, modifier = Modifier.size(32.dp)) {
+                                            Icon(Icons.Default.Edit, "Edit BPM", tint = StudioMuted, modifier = Modifier.size(14.dp))
+                                        }
+                                    }
+                                }
+                                Spacer(modifier = Modifier.height(8.dp))
+                                WaveformVisualizer(
+                                    waveform = waveformData,
+                                    color = StudioGold,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(30.dp)
                                 )
                             }
                         }
@@ -705,6 +752,20 @@ fun ProjectWorkspaceScreen(viewModel: ProjectViewModel, projectId: Long) {
                                             }
                                         }
 
+                                        // Waveform for Original Vocal
+                                        LaunchedEffect(vocal.filePath) {
+                                            viewModel.loadWaveform(vocal.filePath)
+                                        }
+                                        val vocalWaveform = viewModel.waveformState.collectAsState().value[vocal.filePath]
+                                        WaveformVisualizer(
+                                            waveform = vocalWaveform,
+                                            color = if (vocal.isMajor) StudioGold else StudioCyan,
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(top = 8.dp)
+                                                .height(24.dp)
+                                        )
+
                                         // Edit FX Button
                                         Button(
                                             onClick = { viewModel.navigateTo(Screen.VocalProcessor(projectId, vocal.id)) },
@@ -735,30 +796,48 @@ fun ProjectWorkspaceScreen(viewModel: ProjectViewModel, projectId: Long) {
                                     // If processed, offer to preview processed wet sound
                                     if (vocal.processedFilePath != null) {
                                         Spacer(modifier = Modifier.height(6.dp))
-                                        Row(
+                                        Column(
                                             modifier = Modifier
                                                 .fillMaxWidth()
                                                 .background(StudioDarkBg, RoundedCornerShape(4.dp))
-                                                .padding(6.dp),
-                                            verticalAlignment = Alignment.CenterVertically,
-                                            horizontalArrangement = Arrangement.SpaceBetween
+                                                .padding(6.dp)
                                         ) {
-                                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                                Icon(imageVector = Icons.Default.Star, contentDescription = null, tint = StudioGreen, modifier = Modifier.size(12.dp))
-                                                Spacer(modifier = Modifier.width(6.dp))
-                                                Text("FX Upravený vokál:", color = StudioGreen, fontSize = 10.sp, fontWeight = FontWeight.Bold)
-                                            }
-                                            IconButton(
-                                                onClick = { viewModel.playAudio(vocal.processedFilePath) },
-                                                modifier = Modifier.size(28.dp),
-                                                colors = IconButtonDefaults.iconButtonColors(containerColor = StudioGreen, contentColor = Color.Black)
+                                            Row(
+                                                modifier = Modifier.fillMaxWidth(),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.SpaceBetween
                                             ) {
-                                                Icon(
-                                                    imageVector = if (isPlaying && playingPath == vocal.processedFilePath) Icons.Default.Close else Icons.Default.PlayArrow,
-                                                    contentDescription = "Přehrát FX",
-                                                    modifier = Modifier.size(14.dp)
-                                                )
+                                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                                    Icon(imageVector = Icons.Default.Star, contentDescription = null, tint = StudioGreen, modifier = Modifier.size(12.dp))
+                                                    Spacer(modifier = Modifier.width(6.dp))
+                                                    Text("FX Upravený vokál:", color = StudioGreen, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                                                }
+                                                IconButton(
+                                                    onClick = { viewModel.playAudio(vocal.processedFilePath) },
+                                                    modifier = Modifier.size(28.dp),
+                                                    colors = IconButtonDefaults.iconButtonColors(containerColor = StudioGreen, contentColor = Color.Black)
+                                                ) {
+                                                    Icon(
+                                                        imageVector = if (isPlaying && playingPath == vocal.processedFilePath) Icons.Default.Close else Icons.Default.PlayArrow,
+                                                        contentDescription = "Přehrát FX",
+                                                        modifier = Modifier.size(14.dp)
+                                                    )
+                                                }
                                             }
+                                            
+                                            // Waveform for Processed Vocal
+                                            LaunchedEffect(vocal.processedFilePath) {
+                                                viewModel.loadWaveform(vocal.processedFilePath!!)
+                                            }
+                                            val fxWaveform = viewModel.waveformState.collectAsState().value[vocal.processedFilePath]
+                                            WaveformVisualizer(
+                                                waveform = fxWaveform,
+                                                color = StudioGreen,
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .padding(top = 4.dp)
+                                                    .height(16.dp)
+                                            )
                                         }
                                     }
                                 }
@@ -859,6 +938,20 @@ fun ProjectWorkspaceScreen(viewModel: ProjectViewModel, projectId: Long) {
                                     )
                                 }
                             }
+                            
+                            // Waveform for Master Mix
+                            LaunchedEffect(activeProj.mixedFilePath) {
+                                viewModel.loadWaveform(activeProj.mixedFilePath!!)
+                            }
+                            val masterWaveform = viewModel.waveformState.collectAsState().value[activeProj.mixedFilePath!!]
+                            WaveformVisualizer(
+                                waveform = masterWaveform,
+                                color = StudioGreen,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(top = 12.dp)
+                                    .height(36.dp)
+                            )
                         }
                     }
                 }
@@ -1370,6 +1463,48 @@ fun VocalProcessorScreen(viewModel: ProjectViewModel, projectId: Long, vocalId: 
 
         item {
             Spacer(modifier = Modifier.height(32.dp))
+        }
+    }
+}
+
+@Composable
+fun WaveformVisualizer(
+    waveform: FloatArray?,
+    color: Color,
+    modifier: Modifier = Modifier
+) {
+    if (waveform == null) {
+        Box(
+            modifier = modifier
+                .background(StudioCardBg)
+                .border(1.dp, StudioBorder, RoundedCornerShape(4.dp)),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(text = "Načítám vizualizaci...", color = StudioMuted, fontSize = 10.sp)
+        }
+        return
+    }
+
+    Canvas(
+        modifier = modifier
+            .background(StudioCardBg)
+            .border(1.dp, StudioBorder, RoundedCornerShape(4.dp))
+            .padding(2.dp)
+    ) {
+        val width = size.width
+        val height = size.height
+        val barWidth = width / waveform.size
+        
+        for ((index, amp) in waveform.withIndex()) {
+            val barHeight = (amp * height).coerceAtLeast(1f) // Ensure minimum height of 1px
+            val x = index * barWidth
+            val y = (height - barHeight) / 2f
+            
+            drawRect(
+                color = color,
+                topLeft = androidx.compose.ui.geometry.Offset(x, y),
+                size = androidx.compose.ui.geometry.Size(barWidth * 0.8f, barHeight)
+            )
         }
     }
 }

@@ -56,6 +56,10 @@ class ProjectViewModel(application: Application) : AndroidViewModel(application)
     private val _playingPath = MutableStateFlow<String?>(null)
     val playingPath: StateFlow<String?> = _playingPath.asStateFlow()
 
+    private val waveformCache = mutableMapOf<String, FloatArray>()
+    private val _waveformState = MutableStateFlow<Map<String, FloatArray>>(emptyMap())
+    val waveformState: StateFlow<Map<String, FloatArray>> = _waveformState.asStateFlow()
+
     init {
         // Monitor current screen and update project/vocal context accordingly
         viewModelScope.launch {
@@ -84,6 +88,20 @@ class ProjectViewModel(application: Application) : AndroidViewModel(application)
 
     fun clearStatusMessage() {
         _statusMessage.value = null
+    }
+
+    fun loadWaveform(filePath: String, numBars: Int = 50) {
+        if (waveformCache.containsKey(filePath)) return
+        viewModelScope.launch(Dispatchers.IO) {
+            val file = File(filePath)
+            if (file.exists()) {
+                val data = AudioEngine.extractWaveform(file, numBars)
+                if (data != null) {
+                    waveformCache[filePath] = data
+                    _waveformState.value = waveformCache.toMap()
+                }
+            }
+        }
     }
 
     private fun loadProjectDetails(projectId: Long) {
@@ -131,6 +149,17 @@ class ProjectViewModel(application: Application) : AndroidViewModel(application)
                 if (_currentProject.value?.id == project.id) {
                     navigateTo(Screen.Dashboard)
                 }
+            }
+        }
+    }
+
+    fun updateProjectBpm(projectId: Long, newBpm: Double) {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                val project = repository.getProjectById(projectId) ?: return@withContext
+                val updatedProject = project.copy(bpm = newBpm)
+                repository.updateProject(updatedProject)
+                _currentProject.value = updatedProject
             }
         }
     }
@@ -316,7 +345,7 @@ class ProjectViewModel(application: Application) : AndroidViewModel(application)
     fun saveAndProcessVocal(vocal: VocalFileEntity) {
         viewModelScope.launch {
             _isLoading.value = true
-            _statusMessage.value = "Zpracovávám efekty rapového řetězce..."
+            _statusMessage.value = "Zpracovávám efekty (Odšumování, Normalizace, Komprese)..."
 
             withContext(Dispatchers.IO) {
                 try {
@@ -381,7 +410,7 @@ class ProjectViewModel(application: Application) : AndroidViewModel(application)
 
         viewModelScope.launch {
             _isLoading.value = true
-            _statusMessage.value = "Míchám beat a vokály. Zarovnávám double stopy..."
+            _statusMessage.value = "Aplikuji Auto-EQ (notch filtr pro vokál) na beat a míchám stopy..."
 
             withContext(Dispatchers.IO) {
                 try {
