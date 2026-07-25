@@ -6,7 +6,6 @@ import com.example.data.VocalFileEntity
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.math.abs
@@ -17,69 +16,211 @@ import kotlin.math.sin
 
 object AudioEngine {
     private const val TAG = "AudioEngine"
-    private const val SAMPLE_RATE = 44100
+    private const val TARGET_SAMPLE_RATE = 48000
     private const val CHANNELS_MONO = 1
     private const val CHANNELS_STEREO = 2
-    private const val BITS_PER_SAMPLE_16 = 16
+    private const val DEFAULT_EXPORT_BITS = 24
 
     enum class AudioType {
         BEAT,
         VOCAL
     }
 
-    class WavData(val samples: ShortArray, val numChannels: Int, val sampleRate: Int, val bitsPerSample: Int)
+    class WavData(
+        val floatSamples: FloatArray,
+        val numChannels: Int,
+        val sampleRate: Int,
+        val bitsPerSample: Int
+    ) {
+        val samples: ShortArray
+            get() = ShortArray(floatSamples.size) { i ->
+                (floatSamples[i].coerceIn(-1.0f, 1.0f) * 32767.0f).toInt().toShort()
+            }
+    }
 
+    /**
+     * Parse WAV files supporting 16-bit, 24-bit, and 32-bit (int or float) PCM,
+     * arbitrary sample rates, and mono/stereo configurations.
+     */
     fun parseWavPCM(file: File): WavData? {
         try {
             val bytes = file.readBytes()
             if (bytes.size < 44) return null
-            
-            // Find "data" chunk
-            var offset = 12 // skip RIFF + size + WAVE
+
+            // Validate RIFF header
+            val riffHeader = String(bytes, 0, 4, java.nio.charset.StandardCharsets.US_ASCII)
+            val waveHeader = String(bytes, 8, 4, java.nio.charset.StandardCharsets.US_ASCII)
+            if (riffHeader != "RIFF" || waveHeader != "WAVE") {
+                Log.e(TAG, "Not a valid RIFF/WAVE file: $file")
+                return null
+            }
+
+            var offset = 12
+            var audioFormat = 1 // 1 = PCM, 3 = IEEE Float
             var numChannels = 2
             var sampleRate = 44100
             var bitsPerSample = 16
-            
+            var dataOffset = -1
+            var dataSize = -1
+
             while (offset + 8 <= bytes.size) {
                 val chunkId = String(bytes, offset, 4, java.nio.charset.StandardCharsets.US_ASCII)
                 val chunkSize = ByteBuffer.wrap(bytes, offset + 4, 4).order(ByteOrder.LITTLE_ENDIAN).int
-                
-                if (chunkId == "fmt ") {
-                    numChannels = ByteBuffer.wrap(bytes, offset + 8 + 2, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt()
-                    sampleRate = ByteBuffer.wrap(bytes, offset + 8 + 4, 4).order(ByteOrder.LITTLE_ENDIAN).int
-                    bitsPerSample = ByteBuffer.wrap(bytes, offset + 8 + 14, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt()
+
+                if (chunkId == "fmt " && offset + 8 + 16 <= bytes.size) {
+                    audioFormat = ByteBuffer.wrap(bytes, offset + 8, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt() and 0xFFFF
+                    numChannels = ByteBuffer.wrap(bytes, offset + 10, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt() and 0xFFFF
+                    sampleRate = ByteBuffer.wrap(bytes, offset + 12, 4).order(ByteOrder.LITTLE_ENDIAN).int
+                    bitsPerSample = ByteBuffer.wrap(bytes, offset + 22, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt() and 0xFFFF
                 } else if (chunkId == "data") {
-                    val dataOffset = offset + 8
-                    val dataSize = min(chunkSize, bytes.size - dataOffset)
-                    if (dataSize <= 0) return null
-                    
-                    val shortBuffer = ShortArray(dataSize / 2)
-                    ByteBuffer.wrap(bytes, dataOffset, dataSize).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(shortBuffer)
-                    
-                    return WavData(shortBuffer, numChannels, sampleRate, bitsPerSample)
+                    dataOffset = offset + 8
+                    dataSize = min(chunkSize, bytes.size - dataOffset)
+                    break
                 }
-                
-                // WAV chunks are padded to even bytes
+
                 val paddedChunkSize = if (chunkSize % 2 != 0) chunkSize + 1 else chunkSize
                 offset += 8 + paddedChunkSize
             }
-            
-            // Fallback if not found or malformed: assume 44-byte header
-            val dataSize = bytes.size - 44
-            if (dataSize <= 0) return null
-            val shortBuffer = ShortArray(dataSize / 2)
-            ByteBuffer.wrap(bytes, 44, dataSize).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(shortBuffer)
-            return WavData(shortBuffer, 2, 44100, 16)
+
+            if (dataOffset < 0 || dataSize <= 0) {
+                // Fallback to 44-byte header if data chunk was not explicitly parsed
+                dataOffset = 44
+                dataSize = bytes.size - 44
+                if (dataSize <= 0) return null
+            }
+
+            if (numChannels <= 0 || sampleRate <= 0) return null
+
+            val bytesPerSample = bitsPerSample / 8
+            if (bytesPerSample <= 0) return null
+
+            val totalSamples = dataSize / bytesPerSample
+            val floatSamples = FloatArray(totalSamples)
+
+            val bb = ByteBuffer.wrap(bytes, dataOffset, dataSize).order(ByteOrder.LITTLE_ENDIAN)
+
+            when {
+                bitsPerSample == 16 && (audioFormat == 1 || audioFormat == 65534) -> {
+                    for (i in 0 until totalSamples) {
+                        if (!bb.hasRemaining()) break
+                        floatSamples[i] = bb.short.toFloat() / 32768.0f
+                    }
+                }
+                bitsPerSample == 24 && (audioFormat == 1 || audioFormat == 65534) -> {
+                    for (i in 0 until totalSamples) {
+                        if (bb.remaining() < 3) break
+                        val b0 = bb.get().toInt() and 0xFF
+                        val b1 = bb.get().toInt() and 0xFF
+                        val b2 = bb.get().toInt()
+                        val raw = b0 or (b1 shl 8) or (b2 shl 16)
+                        val signed = if ((raw and 0x800000) != 0) raw or 0xFF000000.toInt() else raw
+                        floatSamples[i] = signed.toFloat() / 8388608.0f
+                    }
+                }
+                bitsPerSample == 32 && audioFormat == 3 -> { // 32-bit IEEE Float
+                    for (i in 0 until totalSamples) {
+                        if (bb.remaining() < 4) break
+                        floatSamples[i] = bb.float.coerceIn(-1.0f, 1.0f)
+                    }
+                }
+                bitsPerSample == 32 && (audioFormat == 1 || audioFormat == 65534) -> { // 32-bit Int PCM
+                    for (i in 0 until totalSamples) {
+                        if (bb.remaining() < 4) break
+                        floatSamples[i] = bb.int.toFloat() / 2147483648.0f
+                    }
+                }
+                else -> {
+                    Log.w(TAG, "Unsupported WAV format: format=$audioFormat, bits=$bitsPerSample")
+                    return null
+                }
+            }
+
+            return WavData(floatSamples, numChannels, sampleRate, bitsPerSample)
         } catch (e: Exception) {
             Log.e(TAG, "Error parsing WAV file $file", e)
             return null
         }
     }
 
+    /**
+     * High-quality linear resampling between any sample rates without changing pitch or tempo
+     */
+    fun resample(
+        input: FloatArray,
+        numChannels: Int,
+        srcRate: Int,
+        targetRate: Int
+    ): FloatArray {
+        if (srcRate == targetRate || input.isEmpty() || numChannels <= 0) return input
+
+        val inputFrames = input.size / numChannels
+        val outputFrames = Math.round(inputFrames.toDouble() * targetRate / srcRate).toInt()
+        if (outputFrames <= 0) return FloatArray(0)
+
+        val output = FloatArray(outputFrames * numChannels)
+        val ratio = srcRate.toDouble() / targetRate.toDouble()
+
+        for (outFrame in 0 until outputFrames) {
+            val srcPos = outFrame * ratio
+            val srcIndex = srcPos.toInt()
+            val frac = (srcPos - srcIndex).toFloat()
+
+            val idx0 = srcIndex.coerceIn(0, inputFrames - 1)
+            val idx1 = (srcIndex + 1).coerceIn(0, inputFrames - 1)
+
+            for (ch in 0 until numChannels) {
+                val s0 = input[idx0 * numChannels + ch]
+                val s1 = input[idx1 * numChannels + ch]
+                output[outFrame * numChannels + ch] = s0 + frac * (s1 - s0)
+            }
+        }
+        return output
+    }
+
+    /**
+     * Converts any multi-channel or mono float buffer to stereo
+     */
+    fun toStereo(input: FloatArray, numChannels: Int): FloatArray {
+        if (numChannels == 2) return input
+        if (numChannels == 1) {
+            val output = FloatArray(input.size * 2)
+            for (i in input.indices) {
+                val s = input[i]
+                output[i * 2] = s
+                output[i * 2 + 1] = s
+            }
+            return output
+        }
+        val frames = input.size / numChannels
+        val output = FloatArray(frames * 2)
+        for (f in 0 until frames) {
+            output[f * 2] = input[f * numChannels]
+            output[f * 2 + 1] = input[f * numChannels + 1]
+        }
+        return output
+    }
+
+    /**
+     * Converts stereo/multi-channel float buffer to mono by averaging
+     */
+    fun toMono(input: FloatArray, numChannels: Int): FloatArray {
+        if (numChannels == 1) return input
+        val frames = input.size / numChannels
+        val output = FloatArray(frames)
+        for (f in 0 until frames) {
+            var sum = 0.0f
+            for (ch in 0 until numChannels) {
+                sum += input[f * numChannels + ch]
+            }
+            output[f] = sum / numChannels
+        }
+        return output
+    }
+
     fun extractWaveform(file: File, numBars: Int): FloatArray? {
         try {
             val wavData = parseWavPCM(file) ?: return null
-            val samples = wavData.samples
+            val samples = wavData.floatSamples
             if (samples.isEmpty()) return null
 
             val bars = FloatArray(numBars)
@@ -91,9 +232,9 @@ object AudioEngine {
                 val startIdx = b * samplesPerBar
                 val endIdx = min(samples.size, startIdx + samplesPerBar)
                 for (i in startIdx until endIdx) {
-                    maxAmp = max(maxAmp, abs(samples[i].toInt()).toFloat())
+                    maxAmp = max(maxAmp, abs(samples[i]))
                 }
-                bars[b] = maxAmp / 32768.0f // Normalize to 0.0 - 1.0
+                bars[b] = maxAmp.coerceIn(0.0f, 1.0f)
             }
             return bars
         } catch (e: Exception) {
@@ -107,31 +248,28 @@ object AudioEngine {
      */
     fun generateTestBeat(context: Context, outputFile: File): Double {
         val durationSec = 10.0
-        val numSamples = (SAMPLE_RATE * durationSec).toInt()
+        val sampleRate = TARGET_SAMPLE_RATE
+        val numSamples = (sampleRate * durationSec).toInt()
         val bpm = 90.0
         val beatIntervalSec = 60.0 / bpm
-        val samplesPerBeat = (SAMPLE_RATE * beatIntervalSec).toInt()
+        val samplesPerBeat = (sampleRate * beatIntervalSec).toInt()
 
-        val buffer = ShortArray(numSamples)
+        val buffer = FloatArray(numSamples)
         for (i in 0 until numSamples) {
             val beatIndex = i / samplesPerBeat
             val sampleInBeat = i % samplesPerBeat
 
-            // Heavy sub-bass kick drum at start of every beat
             val kickFreq = max(40.0, 150.0 * 2.0.pow(-sampleInBeat.toDouble() / 2500.0))
             val kickAmplitude = max(0.0, 1.0 - (sampleInBeat.toDouble() / 12000.0))
-            val kick = sin(2.0 * Math.PI * kickFreq * (sampleInBeat.toDouble() / SAMPLE_RATE)) * kickAmplitude
+            val kick = sin(2.0 * Math.PI * kickFreq * (sampleInBeat.toDouble() / sampleRate)) * kickAmplitude
 
-            // Snare on beat 1 and 3 (every alternate beat)
             var snare = 0.0
             if (beatIndex % 2 == 1 && sampleInBeat < 8000) {
-                // Noise burst for snare
                 val noise = (Math.random() * 2.0 - 1.0)
                 val snareDecay = max(0.0, 1.0 - (sampleInBeat.toDouble() / 8000.0))
                 snare = noise * snareDecay * 0.45
             }
 
-            // Hi-hat on eighth notes
             var hihat = 0.0
             val eighthNoteSamples = samplesPerBeat / 2
             val sampleInEighth = i % eighthNoteSamples
@@ -141,98 +279,81 @@ object AudioEngine {
                 hihat = noise * hatDecay * 0.15
             }
 
-            // Add simple synth melody on off-beats
             var synth = 0.0
             if (beatIndex % 4 != 0 && sampleInBeat > eighthNoteSamples && sampleInBeat < eighthNoteSamples + 6000) {
                 val noteFreq = when (beatIndex % 4) {
-                    1 -> 220.0  // A3
-                    2 -> 261.63 // C4
-                    else -> 293.66 // D4
+                    1 -> 220.0
+                    2 -> 261.63
+                    else -> 293.66
                 }
-                val synthT = (sampleInBeat - eighthNoteSamples).toDouble() / SAMPLE_RATE
+                val synthT = (sampleInBeat - eighthNoteSamples).toDouble() / sampleRate
                 val synthDecay = max(0.0, 1.0 - ((sampleInBeat - eighthNoteSamples).toDouble() / 6000.0))
                 synth = sin(2.0 * Math.PI * noteFreq * synthT) * synthDecay * 0.25
             }
 
             val mix = (kick * 0.6) + snare + hihat + synth
-            val clamped = max(-1.0, min(1.0, mix))
-            buffer[i] = (clamped * 32767).toInt().toShort()
+            buffer[i] = mix.toFloat().coerceIn(-1.0f, 1.0f)
         }
 
-        writeWavFile(outputFile, buffer, CHANNELS_MONO)
+        writeWavFile(outputFile, buffer, CHANNELS_MONO, sampleRate, DEFAULT_EXPORT_BITS)
         return bpm
     }
 
     /**
-     * Synthesizes a high-quality test Vocal WAV file (contains voice phrases, hum, sibilance, noise)
+     * Synthesizes a high-quality test Vocal WAV file
      */
     fun generateTestVocal(context: Context, outputFile: File) {
         val durationSec = 10.0
-        val numSamples = (SAMPLE_RATE * durationSec).toInt()
+        val sampleRate = TARGET_SAMPLE_RATE
+        val numSamples = (sampleRate * durationSec).toInt()
         val bpm = 90.0
         val beatIntervalSec = 60.0 / bpm
-        val samplesPerBeat = (SAMPLE_RATE * beatIntervalSec).toInt()
+        val samplesPerBeat = (sampleRate * beatIntervalSec).toInt()
 
-        val buffer = ShortArray(numSamples)
+        val buffer = FloatArray(numSamples)
         for (i in 0 until numSamples) {
             val beatIndex = i / samplesPerBeat
             val sampleInBeat = i % samplesPerBeat
 
-            // Generate vocal-like synthesized formant wave only during certain parts of each beat
-            // This simulates standard rap delivery (syllables on sixteenth notes with pauses)
             var voice = 0.0
             val sixteenthSamples = samplesPerBeat / 4
             val sampleInSixteenth = i % sixteenthSamples
             val sixteenthIndex = sampleInBeat / sixteenthSamples
 
-            // Rest on last beat of 4 beats
             val isRest = (beatIndex % 4 == 3)
 
             if (!isRest && sixteenthIndex < 3 && sampleInSixteenth < sixteenthSamples * 0.8) {
-                // Vocal simulation (formant-like rich triangle wave modulated by subharmonics)
                 val baseFreq = when (sixteenthIndex) {
-                    0 -> 140.0 // Pitch variation
+                    0 -> 140.0
                     1 -> 155.0
                     else -> 130.0
                 }
-                val voiceT = sampleInSixteenth.toDouble() / SAMPLE_RATE
-                // Add first 3 harmonics to simulate human voice formant
+                val voiceT = sampleInSixteenth.toDouble() / sampleRate
                 val h1 = sin(2.0 * Math.PI * baseFreq * voiceT)
                 val h2 = sin(2.0 * Math.PI * (baseFreq * 2.0) * voiceT) * 0.5
                 val h3 = sin(2.0 * Math.PI * (baseFreq * 3.0) * voiceT) * 0.25
                 val formant = (h1 + h2 + h3) / 1.75
 
-                // Syllable volume envelope
                 val volumeEnv = sin(Math.PI * (sampleInSixteenth.toDouble() / (sixteenthSamples * 0.8)))
                 voice = formant * volumeEnv * 0.5
 
-                // Add simulated sibilant "S" at the end of some words
                 if (sixteenthIndex == 2 && sampleInSixteenth > sixteenthSamples * 0.6) {
                     val noise = (Math.random() * 2.0 - 1.0)
                     val sEnv = (sampleInSixteenth - sixteenthSamples * 0.6).toDouble() / (sixteenthSamples * 0.2)
-                    voice += noise * sEnv * 0.25 // Strong harsh high frequency sibilance!
+                    voice += noise * sEnv * 0.25
                 }
             }
 
-            // ADD UNWANTED NOISE AND HUM FOR THE FILTER TESTING!
-            // 50 Hz European AC ground loop hum
-            val hum = sin(2.0 * Math.PI * 50.0 * (i.toDouble() / SAMPLE_RATE)) * 0.06
-
-            // Continuous background hiss/white noise
+            val hum = sin(2.0 * Math.PI * 50.0 * (i.toDouble() / sampleRate)) * 0.06
             val hiss = (Math.random() * 2.0 - 1.0) * 0.025
 
-            // Total vocal signal before processing
             val totalMix = voice + hum + hiss
-            val clamped = max(-1.0, min(1.0, totalMix))
-            buffer[i] = (clamped * 32767).toInt().toShort()
+            buffer[i] = totalMix.toFloat().coerceIn(-1.0f, 1.0f)
         }
 
-        writeWavFile(outputFile, buffer, CHANNELS_MONO)
+        writeWavFile(outputFile, buffer, CHANNELS_MONO, sampleRate, DEFAULT_EXPORT_BITS)
     }
 
-    /**
-     * Determines whether the selected audio file is VOCAL or BEAT
-     */
     fun analyzeAudioType(file: File): AudioType {
         val nameLower = file.name.lowercase()
         if (nameLower.contains("beat") || nameLower.contains("instrumental") || nameLower.contains("hudba") || nameLower.contains("instr")) {
@@ -242,52 +363,34 @@ object AudioEngine {
             return AudioType.VOCAL
         }
 
-        // Spectral and dynamic analysis if it's a valid WAV file
         try {
-            FileInputStream(file).use { fis ->
-                val header = ByteArray(44)
-                if (fis.read(header) == 44) {
-                    val pcmBytes = ByteArray(100000) // Read about 50k samples
-                    val readBytes = fis.read(pcmBytes)
-                    if (readBytes > 40) {
-                        val samples = ShortArray(readBytes / 2)
-                        ByteBuffer.wrap(pcmBytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(samples)
+            val wavData = parseWavPCM(file)
+            if (wavData != null && wavData.floatSamples.isNotEmpty()) {
+                val samples = wavData.floatSamples
+                var lowEnergyCount = 0
+                var sumAmp = 0.0
+                var peakAmp = 0.0f
 
-                        // 1. Check for silent passages (vocals have sections of zero amplitude)
-                        var lowEnergyCount = 0
-                        var highTransientCount = 0
-                        var sumAmp = 0.0
-                        var peakAmp = 0
+                val windowSize = 1000
+                var currentWindowSum = 0.0
 
-                        val windowSize = 1000
-                        var currentWindowSum = 0.0
+                for (i in samples.indices) {
+                    val amp = abs(samples[i])
+                    sumAmp += amp
+                    if (amp > peakAmp) peakAmp = amp
 
-                        for (i in samples.indices) {
-                            val amp = abs(samples[i].toInt())
-                            sumAmp += amp
-                            if (amp > peakAmp) peakAmp = amp
-
-                            currentWindowSum += amp
-                            if (i % windowSize == 0) {
-                                val avgWinAmp = currentWindowSum / windowSize
-                                if (avgWinAmp < 300) { // Very quiet
-                                    lowEnergyCount++
-                                }
-                                currentWindowSum = 0.0
-                            }
+                    currentWindowSum += amp
+                    if (i % windowSize == 0) {
+                        val avgWinAmp = currentWindowSum / windowSize
+                        if (avgWinAmp < 0.01f) {
+                            lowEnergyCount++
                         }
-
-                        val averageAmp = sumAmp / samples.size
-                        val crestFactor = if (averageAmp > 0) peakAmp / averageAmp else 0.0
-
-                        Log.d(TAG, "Audio Analysis - Average: $averageAmp, Peak: $peakAmp, Crest: $crestFactor, Quiet Windows: $lowEnergyCount")
-
-                        // Beats have massive, regular peak transients (crest factor high, but low silent windows)
-                        // Vocals have high silence count because they rest between lines
-                        if (lowEnergyCount > (samples.size / windowSize) * 0.15) {
-                            return AudioType.VOCAL
-                        }
+                        currentWindowSum = 0.0
                     }
+                }
+
+                if (lowEnergyCount > (samples.size / windowSize) * 0.15) {
+                    return AudioType.VOCAL
                 }
             }
         } catch (e: Exception) {
@@ -297,9 +400,6 @@ object AudioEngine {
         return AudioType.BEAT
     }
 
-    /**
-     * Helper Biquad Peak Filter (Bell EQ) used to automatically carve space in instrumental beats for vocals.
-     */
     class BiquadPeakingEQ(frequency: Float, sampleRate: Float, q: Float, gainDb: Float) {
         private val b0: Float
         private val b1: Float
@@ -313,7 +413,7 @@ object AudioEngine {
         private var y2 = 0.0f
 
         init {
-            val aVal = Math.pow(10.0, (gainDb / 40.0)).toFloat()
+            val aVal = 10.0.pow((gainDb / 40.0)).toFloat()
             val w0 = (2.0f * Math.PI.toFloat() * frequency / sampleRate)
             val alpha = (sin(w0.toDouble()).toFloat() / (2.0f * q))
             val cosW0 = Math.cos(w0.toDouble()).toFloat()
@@ -342,66 +442,41 @@ object AudioEngine {
         }
     }
 
-    /**
-     * Accurately detects the BPM of a beat track using transient-energy pulse peaks
-     */
     fun detectBPM(file: File): Double {
         try {
             val wavData = parseWavPCM(file) ?: return 90.0
-            val samples = wavData.samples
-            val channels = wavData.numChannels
+            val monoSamples = toMono(wavData.floatSamples, wavData.numChannels)
             val sampleRate = wavData.sampleRate
 
-            if (sampleRate <= 0 || channels <= 0) return 90.0
+            if (sampleRate <= 0 || monoSamples.size < sampleRate * 3) return 90.0
 
-            val samplesPerSec = sampleRate * channels
-            val skipSamples = samplesPerSec * 3 // Skip first 3 seconds
-            
-            val startSampleOffset = if (samples.size > skipSamples + samplesPerSec * 8) {
-                skipSamples
-            } else {
-                0
-            }
-            
+            val skipSamples = sampleRate * 3
+            val startOffset = if (monoSamples.size > skipSamples + sampleRate * 8) skipSamples else 0
             val secondsToAnalyze = 10
-            val samplesToAnalyze = min(samples.size - startSampleOffset, samplesPerSec * secondsToAnalyze)
+            val samplesToAnalyze = min(monoSamples.size - startOffset, sampleRate * secondsToAnalyze)
+
             if (samplesToAnalyze <= 1000) return 90.0
 
-            // Convert samples to mono float samples (-1.0 to 1.0)
-            val totalFrames = samplesToAnalyze / channels
-            val monoSamples = FloatArray(totalFrames)
-
-            for (f in 0 until totalFrames) {
-                var sum = 0.0f
-                for (c in 0 until channels) {
-                    sum += samples[startSampleOffset + f * channels + c].toFloat() / 32768.0f
-                }
-                monoSamples[f] = sum / channels
-            }
-
-            // Now compute energy envelope in windows of 1024 samples (approx 23ms at 44.1kHz)
             val windowSize = 1024
-            val numWindows = monoSamples.size / windowSize
+            val numWindows = samplesToAnalyze / windowSize
             if (numWindows < 10) return 90.0
             val energies = DoubleArray(numWindows)
 
             for (w in 0 until numWindows) {
                 var sum = 0.0
                 for (s in 0 until windowSize) {
-                    val idx = w * windowSize + s
+                    val idx = startOffset + w * windowSize + s
                     val amp = monoSamples[idx].toDouble()
                     sum += amp * amp
                 }
                 energies[w] = sum / windowSize
             }
 
-            // Smooth energies
             val smoothed = DoubleArray(numWindows)
             for (w in 1 until numWindows - 1) {
-                smoothed[w] = (energies[w-1] + energies[w] + energies[w+1]) / 3.0
+                smoothed[w] = (energies[w - 1] + energies[w] + energies[w + 1]) / 3.0
             }
 
-            // Peak/Onset detection using dynamic thresholding
             val peakIndices = mutableListOf<Int>()
             val thresholdMultiplier = 1.25
             for (w in 8 until numWindows - 8) {
@@ -419,10 +494,9 @@ object AudioEngine {
             }
 
             if (peakIndices.size >= 3) {
-                // Collect all reasonable peak intervals (representing beat/sub-beat durations)
                 val intervals = mutableListOf<Int>()
                 for (i in 0 until peakIndices.size - 1) {
-                    for (j in i + 1 until min(peakIndices.size, i + 5)) { // look at immediate neighbors
+                    for (j in i + 1 until min(peakIndices.size, i + 5)) {
                         val diff = peakIndices[j] - peakIndices[i]
                         if (diff in 10..65) {
                             intervals.add(diff)
@@ -431,7 +505,6 @@ object AudioEngine {
                 }
 
                 if (intervals.isNotEmpty()) {
-                    // Find the most frequent interval (mode) using a histogram bucket
                     val histogram = IntArray(100)
                     for (interval in intervals) {
                         if (interval in histogram.indices) {
@@ -454,12 +527,10 @@ object AudioEngine {
                         val intervalSec = bestInterval * (windowSize.toDouble() / sampleRate)
                         val detectedBpm = 60.0 / intervalSec
 
-                        // Standardize BPM within common musical ranges (70 to 145 BPM)
                         var finalBpm = detectedBpm
                         while (finalBpm < 70.0) finalBpm *= 2.0
                         while (finalBpm > 145.0) finalBpm /= 2.0
 
-                        // Round to nearest integer BPM for cleanliness
                         return Math.round(finalBpm).toDouble()
                     }
                 }
@@ -471,7 +542,7 @@ object AudioEngine {
     }
 
     /**
-     * Applies the 9-stage Rap vocal processing chain
+     * Applies vocal processing chain at standard 48 kHz high fidelity rate
      */
     fun processVocal(
         inputFile: File,
@@ -480,27 +551,21 @@ object AudioEngine {
     ): Boolean {
         try {
             val wavData = parseWavPCM(inputFile) ?: return false
-            val shortBuffer = wavData.samples
+            var floatSamples = toMono(wavData.floatSamples, wavData.numChannels)
             
-            // Convert to Float array (-1.0 to 1.0) and downmix stereo to mono if needed
-            var floatSamples = if (wavData.numChannels == 2) {
-                FloatArray(shortBuffer.size / 2) { i ->
-                    (shortBuffer[i * 2].toFloat() + shortBuffer[i * 2 + 1].toFloat()) / 65536.0f
-                }
-            } else {
-                FloatArray(shortBuffer.size) { i ->
-                    shortBuffer[i].toFloat() / 32768.0f
-                }
+            // Resample to 48000 Hz processing rate if necessary
+            val sampleRate = TARGET_SAMPLE_RATE
+            if (wavData.sampleRate != sampleRate) {
+                floatSamples = resample(floatSamples, CHANNELS_MONO, wavData.sampleRate, sampleRate)
             }
 
             // === 1. ODSTRANĚNÍ HLUKU / BRUMU (De-hum Notch Filter) ===
             if (settings.isHumRemovalEnabled) {
                 val humFreq = settings.humRemovalFrequencyHz
-                // Implementation of a 2nd order IIR Notch filter for 50Hz/60Hz
-                val w0 = 2.0f * Math.PI.toFloat() * humFreq / SAMPLE_RATE
-                val q = 15.0f // Narrow notch band
+                val w0 = 2.0f * Math.PI.toFloat() * humFreq / sampleRate
+                val q = 15.0f
                 val alpha = sin(w0.toDouble()).toFloat() / (2.0f * q)
-                
+
                 val b0 = 1.0f
                 val b1 = -2.0f * Math.cos(w0.toDouble()).toFloat()
                 val b2 = 1.0f
@@ -508,7 +573,6 @@ object AudioEngine {
                 val a1 = -2.0f * Math.cos(w0.toDouble()).toFloat()
                 val a2 = 1.0f - alpha
 
-                // Coefficients normalized by a0
                 val nb0 = b0 / a0
                 val nb1 = b1 / a0
                 val nb2 = b2 / a0
@@ -534,8 +598,8 @@ object AudioEngine {
             // === 2. ODSTRANĚNÍ ŠUMU (Noise Gate / Expander) ===
             if (settings.isNoiseGateEnabled) {
                 val gateThreshold = 10.0f.pow(settings.noiseGateThresholdDb / 20.0f)
-                val releaseCoeff = Math.exp(-1.0 / (SAMPLE_RATE * (settings.noiseGateReleaseMs / 1000.0))).toFloat()
-                
+                val releaseCoeff = Math.exp(-1.0 / (sampleRate * (settings.noiseGateReleaseMs / 1000.0))).toFloat()
+
                 var envelope = 0.0f
                 val windowSize = 256
                 for (i in floatSamples.indices step windowSize) {
@@ -546,9 +610,9 @@ object AudioEngine {
                     }
 
                     if (peak > gateThreshold) {
-                        envelope = 1.0f // Open gate
+                        envelope = 1.0f
                     } else {
-                        envelope *= releaseCoeff // Slowly close gate
+                        envelope *= releaseCoeff
                     }
 
                     for (k in i until limit) {
@@ -560,7 +624,6 @@ object AudioEngine {
             // === 3. ODSTRANĚNÍ OZVĚNY (De-reverb / Expander) ===
             if (settings.isEchoRemovalEnabled) {
                 val attenuationFactor = 10.0f.pow(settings.echoRemovalAttenuationDb / 20.0f)
-                // We damp the tail of high-energy decays to simulate echo removal
                 var runningPeak = 0.0f
                 val decayRate = 0.9999f
                 for (n in floatSamples.indices) {
@@ -571,7 +634,6 @@ object AudioEngine {
                         runningPeak *= decayRate
                     }
 
-                    // If we are in the decaying region (echo), apply dampening
                     if (runningPeak > 0.01f && inputAbs < runningPeak * 0.1f) {
                         floatSamples[n] *= attenuationFactor
                     }
@@ -597,27 +659,23 @@ object AudioEngine {
             // === 5. DE-ESSER (Sibilance Control) ===
             if (settings.isDeEsserEnabled) {
                 val deEsserThreshold = 10.0f.pow(settings.deEsserThresholdDb / 20.0f)
-                // Sibilant detection: check energy in 5-8kHz band vs low band
-                // A simple bandpass-like difference filter to estimate high frequencies
                 var prevSample = 0.0f
                 for (n in floatSamples.indices) {
-                    val hp = floatSamples[n] - prevSample // Simple high pass
+                    val hp = floatSamples[n] - prevSample
                     prevSample = floatSamples[n]
 
-                    // If high-frequency component is large, damp it
                     if (abs(hp) > deEsserThreshold) {
-                        floatSamples[n] *= 0.65f // Attenuate sibilants
+                        floatSamples[n] *= 0.65f
                     }
                 }
             }
 
             // === 6. EQ (HPF, Boxy Cut, Presence, Air) ===
             if (settings.isEqEnabled) {
-                // First-order High Pass Filter to cut below 90 Hz
                 var lastIn = 0.0f
                 var lastOut = 0.0f
                 val hpfCutoff = settings.eqHighPassHz
-                val dt = 1.0f / SAMPLE_RATE
+                val dt = 1.0f / sampleRate
                 val RC = 1.0f / (2.0f * Math.PI.toFloat() * hpfCutoff)
                 val alpha = RC / (RC + dt)
 
@@ -629,24 +687,19 @@ object AudioEngine {
                     floatSamples[n] = output
                 }
 
-                // Mid range dip and High boost: simple sliding difference for fast EQ
-                // Low-mid boxiness cut: around 300Hz (represented by moving average difference)
-                // High-mid presence boost: around 3.5kHz
-                // High shelf air boost: 10kHz+
                 val presenceGain = 10.0f.pow(settings.eqHighMidBoostDb / 20.0f) - 1.0f
                 val airGain = 10.0f.pow(settings.eqHighShelfDb / 20.0f) - 1.0f
-                val boxyReduction = 10.0f.pow(settings.eqLowMidCutDb / 20.0f) // negative dB
+                val boxyReduction = 10.0f.pow(settings.eqLowMidCutDb / 20.0f)
 
                 var e1 = 0.0f
                 var e2 = 0.0f
                 for (n in floatSamples.indices) {
                     val curr = floatSamples[n]
-                    val highFreqs = curr - e1 // high-pass representation
-                    val airFreqs = curr - e2 // extreme high frequency
+                    val highFreqs = curr - e1
+                    val airFreqs = curr - e2
 
                     floatSamples[n] = curr * boxyReduction + (highFreqs * presenceGain * 0.4f) + (airFreqs * airGain * 0.3f)
-                    
-                    // low-pass updates for spectral separation
+
                     e1 = e1 * 0.85f + curr * 0.15f
                     e2 = e2 * 0.95f + curr * 0.05f
                 }
@@ -656,14 +709,13 @@ object AudioEngine {
             if (settings.isCompressionEnabled) {
                 val threshold = 10.0f.pow(settings.compressionThresholdDb / 20.0f)
                 val ratio = settings.compressionRatio
-                val attackCoeff = Math.exp(-1.0 / (SAMPLE_RATE * (settings.compressionAttackMs / 1000.0))).toFloat()
-                val releaseCoeff = Math.exp(-1.0 / (SAMPLE_RATE * (settings.compressionReleaseMs / 1000.0))).toFloat()
+                val attackCoeff = Math.exp(-1.0 / (sampleRate * (settings.compressionAttackMs / 1000.0))).toFloat()
+                val releaseCoeff = Math.exp(-1.0 / (sampleRate * (settings.compressionReleaseMs / 1000.0))).toFloat()
 
                 var envelope = 0.0f
                 for (n in floatSamples.indices) {
                     val inputAbs = abs(floatSamples[n])
-                    
-                    // Attack vs Release envelope follower
+
                     if (inputAbs > envelope) {
                         envelope = attackCoeff * envelope + (1.0f - attackCoeff) * inputAbs
                     } else {
@@ -671,7 +723,6 @@ object AudioEngine {
                     }
 
                     if (envelope > threshold && envelope > 0.0f) {
-                        // Compress above threshold
                         val gainDb = 20.0f * Math.log10(envelope.toDouble()).toFloat()
                         val threshDb = settings.compressionThresholdDb
                         val compressedGainDb = threshDb + (gainDb - threshDb) / ratio
@@ -681,51 +732,39 @@ object AudioEngine {
                 }
             }
 
-            // === 8. STEREORIZER (Haas Delay - mono to stereo copy) ===
-            // This is applied in final WAV write or output formatting
-            val channelsToWrite = if (settings.isStereorizerEnabled) CHANNELS_STEREO else CHANNELS_MONO
+            // === 8 & 9. STEREORIZER & LIMITER ===
+            var outChannels = CHANNELS_MONO
+            var finalSamples = floatSamples
 
-            // === 9. LIMITER (Hard Peak Limiting) ===
+            if (settings.isStereorizerEnabled) {
+                outChannels = CHANNELS_STEREO
+                val delaySamples = (sampleRate * (settings.stereorizerDelayMs / 1000.0)).toInt()
+                val stereoBuffer = FloatArray(floatSamples.size * 2)
+
+                for (n in floatSamples.indices) {
+                    stereoBuffer[n * 2] = floatSamples[n]
+                    val delayedIndex = n - delaySamples
+                    stereoBuffer[n * 2 + 1] = if (delayedIndex >= 0) floatSamples[delayedIndex] else 0.0f
+                }
+                finalSamples = stereoBuffer
+            }
+
             val limitThreshold = if (settings.isLimiterEnabled) {
                 10.0f.pow(settings.limiterThresholdDb / 20.0f)
-            } else 1.0f
+            } else 0.98f
             val limitCeiling = if (settings.isLimiterEnabled) {
                 10.0f.pow(settings.limiterCeilingDb / 20.0f)
             } else 0.98f
 
-            for (n in floatSamples.indices) {
-                var value = floatSamples[n]
+            for (n in finalSamples.indices) {
+                var value = finalSamples[n]
                 if (abs(value) > limitThreshold) {
                     value = Math.signum(value) * limitThreshold
                 }
-                // Clamp strictly to ceiling
-                if (value > limitCeiling) value = limitCeiling
-                if (value < -limitCeiling) value = -limitCeiling
-                floatSamples[n] = value
+                finalSamples[n] = value.coerceIn(-limitCeiling, limitCeiling)
             }
 
-            // Convert back to 16-bit Short buffer
-            val finalShorts = ShortArray(floatSamples.size * channelsToWrite)
-            if (settings.isStereorizerEnabled) {
-                // Stereo Haas Delay
-                val delaySamples = (SAMPLE_RATE * (settings.stereorizerDelayMs / 1000.0)).toInt()
-                for (n in floatSamples.indices) {
-                    // Left channel is original
-                    finalShorts[n * 2] = (floatSamples[n] * 32767).toInt().toShort()
-
-                    // Right channel is delayed original
-                    val delayedIndex = n - delaySamples
-                    val delayedSample = if (delayedIndex >= 0) floatSamples[delayedIndex] else 0.0f
-                    // Pan right channel slightly or add delay
-                    finalShorts[n * 2 + 1] = (delayedSample * 32767).toInt().toShort()
-                }
-            } else {
-                for (n in floatSamples.indices) {
-                    finalShorts[n] = (floatSamples[n] * 32767).toInt().toShort()
-                }
-            }
-
-            writeWavFile(outputFile, finalShorts, channelsToWrite)
+            writeWavFile(outputFile, finalSamples, outChannels, sampleRate, DEFAULT_EXPORT_BITS)
             return true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to process vocal track", e)
@@ -734,8 +773,7 @@ object AudioEngine {
     }
 
     /**
-     * Automatically aligns and mixes multiple vocal files with a beat file
-     * Handling major/minor vocal double tracking and stereo width automatically.
+     * Mixes beat and vocal files into a master 24-bit / 48 kHz stereo WAV file with automatic pocket EQ carving and peak limiting.
      */
     fun mixProject(
         beatFile: File,
@@ -744,65 +782,47 @@ object AudioEngine {
     ): Boolean {
         try {
             val beatWav = parseWavPCM(beatFile) ?: return false
-            val beatShorts = beatWav.samples
-            val beatChannels = beatWav.numChannels
-            
-            val numBeatStereoSamples = if (beatChannels == CHANNELS_STEREO) beatShorts.size / 2 else beatShorts.size
+            var beatStereo = toStereo(beatWav.floatSamples, beatWav.numChannels)
 
-            val mixedL = FloatArray(numBeatStereoSamples)
-            val mixedR = FloatArray(numBeatStereoSamples)
-
-            if (beatChannels == CHANNELS_STEREO) {
-                for (i in 0 until numBeatStereoSamples) {
-                    mixedL[i] = beatShorts[i * 2].toFloat() / 32768.0f
-                    mixedR[i] = beatShorts[i * 2 + 1].toFloat() / 32768.0f
-                }
-            } else {
-                for (i in 0 until numBeatStereoSamples) {
-                    val sample = beatShorts[i].toFloat() / 32768.0f
-                    mixedL[i] = sample
-                    mixedR[i] = sample
-                }
+            val masterSampleRate = TARGET_SAMPLE_RATE
+            if (beatWav.sampleRate != masterSampleRate) {
+                beatStereo = resample(beatStereo, CHANNELS_STEREO, beatWav.sampleRate, masterSampleRate)
             }
 
-            // Apply Auto-EQ on the Beat to carve out space for vocals (cuts at 250Hz for mud, 1800Hz for vocal pocket)
-            val beatEq1L = BiquadPeakingEQ(250f, SAMPLE_RATE.toFloat(), 1.0f, -3.0f)
-            val beatEq1R = BiquadPeakingEQ(250f, SAMPLE_RATE.toFloat(), 1.0f, -3.0f)
-            val beatEq2L = BiquadPeakingEQ(1800f, SAMPLE_RATE.toFloat(), 1.0f, -4.5f)
-            val beatEq2R = BiquadPeakingEQ(1800f, SAMPLE_RATE.toFloat(), 1.0f, -4.5f)
+            val numStereoSamples = beatStereo.size / 2
+            val mixedL = FloatArray(numStereoSamples)
+            val mixedR = FloatArray(numStereoSamples)
 
-            for (i in 0 until numBeatStereoSamples) {
+            for (i in 0 until numStereoSamples) {
+                mixedL[i] = beatStereo[i * 2]
+                mixedR[i] = beatStereo[i * 2 + 1]
+            }
+
+            // Apply Auto-EQ on beat at 48000 Hz to carve space for vocal presence (-3dB at 250Hz, -4.5dB at 1800Hz)
+            val beatEq1L = BiquadPeakingEQ(250f, masterSampleRate.toFloat(), 1.0f, -3.0f)
+            val beatEq1R = BiquadPeakingEQ(250f, masterSampleRate.toFloat(), 1.0f, -3.0f)
+            val beatEq2L = BiquadPeakingEQ(1800f, masterSampleRate.toFloat(), 1.0f, -4.5f)
+            val beatEq2R = BiquadPeakingEQ(1800f, masterSampleRate.toFloat(), 1.0f, -4.5f)
+
+            for (i in 0 until numStereoSamples) {
                 mixedL[i] = beatEq2L.process(beatEq1L.process(mixedL[i]))
                 mixedR[i] = beatEq2R.process(beatEq1R.process(mixedR[i]))
             }
-            Log.d(TAG, "Applied automatic pocket carving EQ on instrumental beat (-3dB at 250Hz, -4.5dB at 1800Hz)")
 
-            // Process and layer each vocal file onto the mixed buffer
             val parsedVocals = vocalFiles.mapNotNull { (file, entity) ->
                 val vWav = parseWavPCM(file) ?: return@mapNotNull null
-                val vShorts = vWav.samples
-                val vChannels = vWav.numChannels
-                val vSamples = FloatArray(if (vChannels == CHANNELS_STEREO) vShorts.size / 2 else vShorts.size)
-
-                if (vChannels == CHANNELS_STEREO) {
-                    for (i in vSamples.indices) {
-                        // Average stereo down to mono for panning/mixing consistency
-                        vSamples[i] = (vShorts[i * 2].toFloat() + vShorts[i * 2 + 1].toFloat()) / 65536.0f
-                    }
-                } else {
-                    for (i in vSamples.indices) {
-                        vSamples[i] = vShorts[i].toFloat() / 32768.0f
-                    }
+                var vMono = toMono(vWav.floatSamples, vWav.numChannels)
+                if (vWav.sampleRate != masterSampleRate) {
+                    vMono = resample(vMono, CHANNELS_MONO, vWav.sampleRate, masterSampleRate)
                 }
-                Triple(vSamples, entity, file.length())
+                Triple(vMono, entity, file.length())
             }
 
-            // Identify potential duplicates (vocal tracks with nearly identical file length +/- 1000 bytes)
             val isDuplicate = BooleanArray(parsedVocals.size)
             for (i in parsedVocals.indices) {
                 for (j in i + 1 until parsedVocals.size) {
                     val lenDiff = abs(parsedVocals[i].third - parsedVocals[j].third)
-                    if (lenDiff < 1000) { // Very likely the exact same vocal file!
+                    if (lenDiff < 1000) {
                         isDuplicate[i] = true
                         isDuplicate[j] = true
                     }
@@ -811,44 +831,28 @@ object AudioEngine {
 
             for (idx in parsedVocals.indices) {
                 val (vSamples, entity, _) = parsedVocals[idx]
-                
-                // Determine Major/Minor mixing settings
+
                 var currentVolume = entity.volume
                 var currentPan = entity.panning
-                var currentDelaySamples = (SAMPLE_RATE * (entity.offsetMs / 1000.0)).toInt()
+                var currentDelaySamples = (masterSampleRate * (entity.offsetMs / 1000.0)).toInt()
 
                 if (isDuplicate[idx]) {
-                    // If duplicate same-sounding vocal is found, automatically configure Major/Minor stack
                     if (!entity.isMajor) {
-                        // This is the MINOR backing vocal double
-                        // Pan wide left (-0.85), slightly lower volume, delayed Haas style (20ms) to create massive space!
                         currentPan = -0.75f
-                        currentVolume *= 0.65f // quieter
-                        currentDelaySamples += (SAMPLE_RATE * 0.022).toInt() // Add 22ms offset to separate it in space!
-                        Log.d(TAG, "Auto-Mixed Vocal ${entity.assignedName} as MINOR double track (panned left, -6dB, 22ms delayed)")
+                        currentVolume *= 0.65f
+                        currentDelaySamples += (masterSampleRate * 0.022).toInt()
                     } else {
-                        // This is the MAJOR lead vocal
-                        // Centered, full volume, upfront!
-                        currentPan = 0.75f // Pan it to opposite side (right) to complete the massive stereo wrap!
+                        currentPan = 0.75f
                         currentVolume *= 0.9f
-                        Log.d(TAG, "Auto-Mixed Vocal ${entity.assignedName} as MAJOR lead track (panned right)")
                     }
-                } else {
-                    // Normal vocal panning and volume
-                    currentPan = entity.panning
                 }
 
-                // Add vocal samples to the stereo master mixed buffer
                 for (vIdx in vSamples.indices) {
                     val targetMixedIdx = vIdx + currentDelaySamples
-                    if (targetMixedIdx >= numBeatStereoSamples) break
+                    if (targetMixedIdx >= numStereoSamples) break
                     if (targetMixedIdx < 0) continue
 
                     val sampleValue = vSamples[vIdx] * currentVolume
-
-                    // Pan formula: Constant Power Panning
-                    // Left Gain = cos( (pan + 1) * PI / 4 )
-                    // Right Gain = sin( (pan + 1) * PI / 4 )
                     val panFactor = (currentPan + 1.0f) * (Math.PI.toFloat() / 4.0f)
                     val leftGain = Math.cos(panFactor.toDouble()).toFloat()
                     val rightGain = Math.sin(panFactor.toDouble()).toFloat()
@@ -858,25 +862,23 @@ object AudioEngine {
                 }
             }
 
-            // Write the merged master stereo WAV file with peak limiting to avoid clipping
             var masterMax = 0.0f
-            for (i in 0 until numBeatStereoSamples) {
+            for (i in 0 until numStereoSamples) {
                 masterMax = max(masterMax, abs(mixedL[i]))
                 masterMax = max(masterMax, abs(mixedR[i]))
             }
 
-            // Perfect dynamic limiter for mixed output
-            val masterShorts = ShortArray(numBeatStereoSamples * 2)
+            val masterFloat = FloatArray(numStereoSamples * 2)
             val scaleFactor = if (masterMax > 0.95f) 0.95f / masterMax else 1.0f
 
-            for (i in 0 until numBeatStereoSamples) {
-                val clampedL = max(-1.0f, min(1.0f, mixedL[i] * scaleFactor))
-                val clampedR = max(-1.0f, min(1.0f, mixedR[i] * scaleFactor))
-                masterShorts[i * 2] = (clampedL * 32767.0f).toInt().toShort()
-                masterShorts[i * 2 + 1] = (clampedR * 32767.0f).toInt().toShort()
+            for (i in 0 until numStereoSamples) {
+                val clampedL = (mixedL[i] * scaleFactor).coerceIn(-0.98f, 0.98f)
+                val clampedR = (mixedR[i] * scaleFactor).coerceIn(-0.98f, 0.98f)
+                masterFloat[i * 2] = clampedL
+                masterFloat[i * 2 + 1] = clampedR
             }
 
-            writeWavFile(outputFile, masterShorts, CHANNELS_STEREO)
+            writeWavFile(outputFile, masterFloat, CHANNELS_STEREO, masterSampleRate, DEFAULT_EXPORT_BITS)
             return true
         } catch (e: Exception) {
             Log.e(TAG, "Error mixing project", e)
@@ -885,67 +887,81 @@ object AudioEngine {
     }
 
     /**
-     * Utility method to write a standard 16-bit PCM WAV file with correct header
+     * Utility method to write a FloatArray WAV file (16-bit or 24-bit PCM)
      */
-    private fun writeWavFile(file: File, pcmData: ShortArray, numChannels: Int) {
-        val totalAudioLen = pcmData.size * 2
-        val totalDataLen = totalAudioLen + 36
-        val byteRate = SAMPLE_RATE * numChannels * 2
+    fun writeWavFile(
+        file: File,
+        floatSamples: FloatArray,
+        numChannels: Int,
+        sampleRate: Int = TARGET_SAMPLE_RATE,
+        bitsPerSample: Int = DEFAULT_EXPORT_BITS
+    ) {
+        val bytesPerSample = bitsPerSample / 8
+        val numFrames = floatSamples.size / numChannels
+        val audioDataLen = numFrames * numChannels * bytesPerSample
+        val totalDataLen = audioDataLen + 36
+        val byteRate = sampleRate * numChannels * bytesPerSample
+        val blockAlign = numChannels * bytesPerSample
 
         val header = ByteArray(44)
-        header[0] = 'R'.code.toByte() // RIFF
-        header[1] = 'I'.code.toByte()
-        header[2] = 'F'.code.toByte()
-        header[3] = 'F'.code.toByte()
-        header[4] = (totalDataLen and 0xff).toByte() // file size - 8
+        header[0] = 'R'.code.toByte(); header[1] = 'I'.code.toByte(); header[2] = 'F'.code.toByte(); header[3] = 'F'.code.toByte()
+        header[4] = (totalDataLen and 0xff).toByte()
         header[5] = ((totalDataLen shr 8) and 0xff).toByte()
         header[6] = ((totalDataLen shr 16) and 0xff).toByte()
         header[7] = ((totalDataLen shr 24) and 0xff).toByte()
-        header[8] = 'W'.code.toByte() // WAVE
-        header[9] = 'A'.code.toByte()
-        header[10] = 'V'.code.toByte()
-        header[11] = 'E'.code.toByte()
-        header[12] = 'f'.code.toByte() // fmt
-        header[13] = 'm'.code.toByte()
-        header[14] = 't'.code.toByte()
-        header[15] = ' '.code.toByte()
-        header[16] = 16 // size of fmt chunk
-        header[17] = 0
-        header[18] = 0
-        header[19] = 0
-        header[20] = 1 // format = 1 (PCM)
-        header[21] = 0
-        header[22] = numChannels.toByte() // mono or stereo
-        header[23] = 0
-        header[24] = (SAMPLE_RATE and 0xff).toByte() // sample rate
-        header[25] = ((SAMPLE_RATE shr 8) and 0xff).toByte()
-        header[26] = ((SAMPLE_RATE shr 16) and 0xff).toByte()
-        header[27] = ((SAMPLE_RATE shr 24) and 0xff).toByte()
-        header[28] = (byteRate and 0xff).toByte() // byte rate
+        header[8] = 'W'.code.toByte(); header[9] = 'A'.code.toByte(); header[10] = 'V'.code.toByte(); header[11] = 'E'.code.toByte()
+        header[12] = 'f'.code.toByte(); header[13] = 'm'.code.toByte(); header[14] = 't'.code.toByte(); header[15] = ' '.code.toByte()
+        header[16] = 16; header[17] = 0; header[18] = 0; header[19] = 0
+        header[20] = 1; header[21] = 0 // PCM
+        header[22] = numChannels.toByte(); header[23] = 0
+        header[24] = (sampleRate and 0xff).toByte()
+        header[25] = ((sampleRate shr 8) and 0xff).toByte()
+        header[26] = ((sampleRate shr 16) and 0xff).toByte()
+        header[27] = ((sampleRate shr 24) and 0xff).toByte()
+        header[28] = (byteRate and 0xff).toByte()
         header[29] = ((byteRate shr 8) and 0xff).toByte()
         header[30] = ((byteRate shr 16) and 0xff).toByte()
         header[31] = ((byteRate shr 24) and 0xff).toByte()
-        header[32] = (numChannels * 2).toByte() // block align
-        header[33] = 0
-        header[34] = BITS_PER_SAMPLE_16.toByte() // 16 bits per sample
-        header[35] = 0
-        header[36] = 'd'.code.toByte() // data chunk
-        header[37] = 'a'.code.toByte()
-        header[38] = 't'.code.toByte()
-        header[39] = 'a'.code.toByte()
-        header[40] = (totalAudioLen and 0xff).toByte() // data size
-        header[41] = ((totalAudioLen shr 8) and 0xff).toByte()
-        header[42] = ((totalAudioLen shr 16) and 0xff).toByte()
-        header[43] = ((totalAudioLen shr 24) and 0xff).toByte()
+        header[32] = blockAlign.toByte(); header[33] = 0
+        header[34] = bitsPerSample.toByte(); header[35] = 0
+        header[36] = 'd'.code.toByte(); header[37] = 'a'.code.toByte(); header[38] = 't'.code.toByte(); header[39] = 'a'.code.toByte()
+        header[40] = (audioDataLen and 0xff).toByte()
+        header[41] = ((audioDataLen shr 8) and 0xff).toByte()
+        header[42] = ((audioDataLen shr 16) and 0xff).toByte()
+        header[43] = ((audioDataLen shr 24) and 0xff).toByte()
 
         FileOutputStream(file).use { fos ->
             fos.write(header)
-            val byteBuffer = ByteBuffer.allocate(pcmData.size * 2)
-            byteBuffer.order(ByteOrder.LITTLE_ENDIAN)
-            for (sample in pcmData) {
-                byteBuffer.putShort(sample)
+            val buffer = ByteBuffer.allocate(audioDataLen).order(ByteOrder.LITTLE_ENDIAN)
+            if (bitsPerSample == 24) {
+                for (sample in floatSamples) {
+                    val clamped = sample.coerceIn(-1.0f, 1.0f)
+                    val valInt = (clamped * 8388607.0f).toInt()
+                    buffer.put((valInt and 0xFF).toByte())
+                    buffer.put(((valInt shr 8) and 0xFF).toByte())
+                    buffer.put(((valInt shr 16) and 0xFF).toByte())
+                }
+            } else {
+                for (sample in floatSamples) {
+                    val clamped = sample.coerceIn(-1.0f, 1.0f)
+                    val valShort = (clamped * 32767.0f).toInt().toShort()
+                    buffer.putShort(valShort)
+                }
             }
-            fos.write(byteBuffer.array())
+            fos.write(buffer.array())
         }
+    }
+
+    /**
+     * Backward-compatible helper to write ShortArray WAV file
+     */
+    fun writeWavFile(
+        file: File,
+        pcmData: ShortArray,
+        numChannels: Int,
+        sampleRate: Int = TARGET_SAMPLE_RATE
+    ) {
+        val floatSamples = FloatArray(pcmData.size) { i -> pcmData[i].toFloat() / 32768.0f }
+        writeWavFile(file, floatSamples, numChannels, sampleRate, 16)
     }
 }
