@@ -63,6 +63,9 @@ class ProjectViewModel(application: Application) : AndroidViewModel(application)
 
     private val waveformCache = mutableMapOf<String, FloatArray>()
 
+    private val _waveformState = MutableStateFlow<Map<String, FloatArray>>(emptyMap())
+    val waveformState = _waveformState.asStateFlow()
+
     init {
         viewModelScope.launch {
             _currentScreen.collect { screen ->
@@ -95,20 +98,20 @@ class ProjectViewModel(application: Application) : AndroidViewModel(application)
 
     private suspend fun loadProjectDetails(id: Long) {
 
-    val project = repository.getProjectById(id)
+        val project = repository.getProjectById(id)
 
-    _currentProject.value = project
+        _currentProject.value = project
 
-    if(project != null) {
+        if(project != null) {
 
-        repository.getVocalsForProject(id)
-            .collectLatest { list ->
+            repository.getVocalsForProject(id)
+                .collectLatest { list ->
 
-                _vocals.value = list
+                    _vocals.value = list
 
-            }
+                }
+        }
     }
-}
 
 
     private suspend fun loadVocalDetails(id: Long) {
@@ -272,7 +275,6 @@ class ProjectViewModel(application: Application) : AndroidViewModel(application)
             }
         }
     }
-
 
 
 
@@ -608,7 +610,6 @@ class ProjectViewModel(application: Application) : AndroidViewModel(application)
 
 
 
-
     fun stopAudio() {
 
 
@@ -678,6 +679,10 @@ class ProjectViewModel(application: Application) : AndroidViewModel(application)
                         waveformCache[filePath] =
                             it
 
+                        withContext(Dispatchers.Main) {
+                            _waveformState.value = waveformCache.toMap()
+                        }
+
                     }
             }
         }
@@ -693,10 +698,10 @@ class ProjectViewModel(application: Application) : AndroidViewModel(application)
 
 
 
-    fun mixActiveProject(
-        projectId: Long
-    ) {
+    fun mixActiveProject() {
 
+        val currentProj = _currentProject.value ?: return
+        val projectId = currentProj.id
 
         viewModelScope.launch {
 
@@ -814,150 +819,138 @@ class ProjectViewModel(application: Application) : AndroidViewModel(application)
     }
 
 
-private val _waveformState =
-    MutableStateFlow<FloatArray?>(null)
+    fun updateProjectBpm(
+        projectId: Long,
+        bpm: Double
+    ) {
 
-val waveformState =
-    _waveformState.asStateFlow()
+        viewModelScope.launch(Dispatchers.IO) {
 
-
-fun updateProjectBpm(
-    projectId: Long,
-    bpm: Double
-) {
-
-    viewModelScope.launch(Dispatchers.IO) {
-
-        val project =
-            repository.getProjectById(projectId)
-                ?: return@launch
+            val project =
+                repository.getProjectById(projectId)
+                    ?: return@launch
 
 
-        val updated =
-            project.copy(
-                bpm = bpm.toInt()
-            )
+            val updated =
+                project.copy(
+                    bpm = bpm.toInt()
+                )
 
 
-        repository.updateProject(updated)
+            repository.updateProject(updated)
 
 
-        withContext(Dispatchers.Main) {
-            _currentProject.value = updated
+            withContext(Dispatchers.Main) {
+                _currentProject.value = updated
+            }
         }
     }
-}
 
 
 
-fun deleteVocal(
-    vocal: VocalFileEntity
-) {
+    fun deleteVocal(
+        vocal: VocalFileEntity
+    ) {
 
-    viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch(Dispatchers.IO) {
 
-        File(vocal.filePath)
-            .delete()
+            try {
+                File(vocal.filePath)
+                    .delete()
 
-        repository.deleteVocalFile(vocal)
-    }
-}
+                repository.deleteVocalFile(vocal)
+            } catch(e: Exception) {
 
-
-        } catch(e: Exception) {
-
-            Log.e(
-                TAG,
-                "Delete vocal error",
-                e
-            )
+                Log.e(
+                    TAG,
+                    "Delete vocal error",
+                    e
+                )
+            }
         }
     }
-}
+
+
+    fun createSyntheticProjectAssets(
+        projectId: Long
+    ) {
+
+        viewModelScope.launch(Dispatchers.IO) {
+
+            val project =
+                repository.getProjectById(projectId)
+                    ?: return@launch
+
+
+            val dir =
+                getProjectDir(projectId)
+
+
+            if(!dir.exists())
+                dir.mkdirs()
 
 
 
-
-fun createSyntheticProjectAssets(
-    projectId: Long
-) {
-
-    viewModelScope.launch(Dispatchers.IO) {
-
-        val project =
-            repository.getProjectById(projectId)
-                ?: return@launch
+            val beat =
+                File(
+                    dir,
+                    "${project.name}_TEST_BEAT.wav"
+                )
 
 
-        val dir =
-            getProjectDir(projectId)
-
-
-        if(!dir.exists())
-            dir.mkdirs()
+            val vocal =
+                File(
+                    dir,
+                    "${project.name}_TEST_VOCAL.wav"
+                )
 
 
 
-        val beat =
-            File(
-                dir,
-                "${project.name}_TEST_BEAT.wav"
+            AudioEngine.generateTestBeat(
+                beat
             )
 
 
-        val vocal =
-            File(
-                dir,
-                "${project.name}_TEST_VOCAL.wav"
+            AudioEngine.generateTestVocal(
+                vocal
             )
 
 
 
-        AudioEngine.generateTestBeat(
-            beat
-        )
-
-
-        AudioEngine.generateTestVocal(
-            vocal
-        )
-
-
-
-        repository.updateProject(
-            project.copy(
-                beatFilePath =
-                    beat.absolutePath
-            )
-        )
-
-
-        _statusMessage.value =
-            "Test audio vytvořen"
-    }
-}
-
-
-
-
-fun updateWaveform(
-    path: String
-) {
-
-    viewModelScope.launch(Dispatchers.IO) {
-
-        val waveform =
-            AudioEngine.extractWaveform(
-                File(path)
+            repository.updateProject(
+                project.copy(
+                    beatFilePath =
+                        beat.absolutePath
+                )
             )
 
-        withContext(Dispatchers.Main) {
 
-            _waveformState.value =
-                waveform
+            _statusMessage.value =
+                "Test audio vytvořen"
         }
     }
-}
+
+
+    fun updateWaveform(
+        path: String
+    ) {
+
+        viewModelScope.launch(Dispatchers.IO) {
+
+            val waveform =
+                AudioEngine.extractWaveform(
+                    File(path)
+                )
+
+            withContext(Dispatchers.Main) {
+
+                waveform?.let {
+                    waveformCache[path] = it
+                    _waveformState.value = waveformCache.toMap()
+                }
+            }
+        }
+    }
 
     private fun getProjectDir(
         projectId: Long
