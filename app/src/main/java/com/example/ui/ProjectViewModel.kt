@@ -22,114 +22,123 @@ sealed interface Screen {
 }
 
 class ProjectViewModel(application: Application) : AndroidViewModel(application) {
+
     private val TAG = "ProjectViewModel"
+
     private val database = ProjectDatabase.getDatabase(application)
     private val repository = ProjectRepository(database.projectDao())
 
-    // UI States
-    val allProjects: StateFlow<List<ProjectEntity>> = repository.allProjects
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    val allProjects: StateFlow<List<ProjectEntity>> =
+        repository.allProjects.stateIn(
+            viewModelScope,
+            SharingStarted.WhileSubscribed(5000),
+            emptyList()
+        )
 
     private val _currentScreen = MutableStateFlow<Screen>(Screen.Dashboard)
-    val currentScreen: StateFlow<Screen> = _currentScreen.asStateFlow()
-
-    private val _vocals = MutableStateFlow<List<VocalFileEntity>>(emptyList())
-    val vocals: StateFlow<List<VocalFileEntity>> = _vocals.asStateFlow()
+    val currentScreen = _currentScreen.asStateFlow()
 
     private val _currentProject = MutableStateFlow<ProjectEntity?>(null)
-    val currentProject: StateFlow<ProjectEntity?> = _currentProject.asStateFlow()
+    val currentProject = _currentProject.asStateFlow()
+
+    private val _vocals = MutableStateFlow<List<VocalFileEntity>>(emptyList())
+    val vocals = _vocals.asStateFlow()
 
     private val _currentVocal = MutableStateFlow<VocalFileEntity?>(null)
-    val currentVocal: StateFlow<VocalFileEntity?> = _currentVocal.asStateFlow()
+    val currentVocal = _currentVocal.asStateFlow()
 
     private val _isLoading = MutableStateFlow(false)
-    val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
+    val isLoading = _isLoading.asStateFlow()
 
     private val _statusMessage = MutableStateFlow<String?>(null)
-    val statusMessage: StateFlow<String?> = _statusMessage.asStateFlow()
+    val statusMessage = _statusMessage.asStateFlow()
 
-    // Media Player State
-    private var mediaPlayer: MediaPlayer? = null
     private val _isPlaying = MutableStateFlow(false)
-    val isPlaying: StateFlow<Boolean> = _isPlaying.asStateFlow()
+    val isPlaying = _isPlaying.asStateFlow()
 
     private val _playingPath = MutableStateFlow<String?>(null)
-    val playingPath: StateFlow<String?> = _playingPath.asStateFlow()
+    val playingPath = _playingPath.asStateFlow()
+
+    private var mediaPlayer: MediaPlayer? = null
 
     private val waveformCache = mutableMapOf<String, FloatArray>()
-    private val _waveformState = MutableStateFlow<Map<String, FloatArray>>(emptyMap())
-    val waveformState: StateFlow<Map<String, FloatArray>> = _waveformState.asStateFlow()
 
     init {
-        // Monitor current screen and update project/vocal context accordingly
         viewModelScope.launch {
             _currentScreen.collect { screen ->
+
                 stopAudio()
-                when (screen) {
-                    is Screen.Dashboard -> {
+
+                when(screen) {
+
+                    Screen.Dashboard -> {
                         _currentProject.value = null
                         _currentVocal.value = null
                         _vocals.value = emptyList()
                     }
-                    is Screen.ProjectWorkspace -> {
+
+                    is Screen.ProjectWorkspace ->
                         loadProjectDetails(screen.projectId)
-                    }
-                    is Screen.VocalProcessor -> {
+
+                    is Screen.VocalProcessor ->
                         loadVocalDetails(screen.vocalFileId)
-                    }
                 }
             }
         }
     }
+
 
     fun navigateTo(screen: Screen) {
         _currentScreen.value = screen
     }
 
+
+    private suspend fun loadProjectDetails(id: Long) {
+
+        val project = repository.getProjectById(id)
+
+        _currentProject.value = project
+
+        project?.let {
+
+            repository.getVocalsForProject(id)
+                .collect { list ->
+                    _vocals.value = list
+                }
+        }
+    }
+
+
+    private suspend fun loadVocalDetails(id: Long) {
+
+        _currentVocal.value =
+            repository.getVocalById(id)
+    }
+    
     fun clearStatusMessage() {
         _statusMessage.value = null
     }
 
-    fun loadWaveform(filePath: String, numBars: Int = 50) {
-        if (waveformCache.containsKey(filePath)) return
-        viewModelScope.launch(Dispatchers.IO) {
-            val file = File(filePath)
-            if (file.exists()) {
-                val data = AudioEngine.extractWaveform(file, numBars)
-                if (data != null) {
-                    waveformCache[filePath] = data
-                    _waveformState.value = waveformCache.toMap()
-                }
-            }
-        }
-    }
-
-    private fun loadProjectDetails(projectId: Long) {
-        viewModelScope.launch {
-            val project = repository.getProjectById(projectId)
-            _currentProject.value = project
-            if (project != null) {
-                repository.getVocalsForProject(projectId).collect { list ->
-                    _vocals.value = list
-                }
-            }
-        }
-    }
-
-    private suspend fun loadVocalDetails(vocalId: Long) {
-        val vocal = repository.getVocalById(vocalId)
-        _currentVocal.value = vocal
-    }
 
     fun createProject(name: String) {
+
         viewModelScope.launch(Dispatchers.IO) {
-            val cleanName = name.trim().ifEmpty { "Nový Projekt" }
-            val newProj = ProjectEntity(name = cleanName)
-            val projectId = repository.insertProject(newProj)
-            
-            // Create dedicated project directory
-            val projDir = getProjectDir(projectId)
-            if (!projDir.exists()) projDir.mkdirs()
+
+            val cleanName =
+                name.trim().ifEmpty { "Nový Projekt" }
+
+            val projectId =
+                repository.insertProject(
+                    ProjectEntity(name = cleanName)
+                )
+
+
+            val dir = getProjectDir(projectId)
+
+            if (!dir.exists()) {
+                dir.mkdirs()
+            }
+
 
             withContext(Dispatchers.Main) {
                 navigateTo(Screen.ProjectWorkspace(projectId))
@@ -137,15 +146,21 @@ class ProjectViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+
+
     fun deleteProject(project: ProjectEntity) {
+
         viewModelScope.launch(Dispatchers.IO) {
-            // Delete actual files in project dir
-            val projDir = getProjectDir(project.id)
-            if (projDir.exists()) {
-                projDir.deleteRecursively()
-            }
+
+            getProjectDir(project.id)
+                .deleteRecursively()
+
+
             repository.deleteProject(project)
+
+
             withContext(Dispatchers.Main) {
+
                 if (_currentProject.value?.id == project.id) {
                     navigateTo(Screen.Dashboard)
                 }
@@ -153,370 +168,674 @@ class ProjectViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    fun updateProjectBpm(projectId: Long, newBpm: Double) {
-        viewModelScope.launch {
-            withContext(Dispatchers.IO) {
-                val project = repository.getProjectById(projectId) ?: return@withContext
-                val updatedProject = project.copy(bpm = newBpm)
-                repository.updateProject(updatedProject)
-                _currentProject.value = updatedProject
-            }
-        }
-    }
 
-    /**
-     * Imports an instrumental beat file and automatically detects its BPM
-     */
-    fun importBeatFile(projectId: Long, originalName: String, inputStream: InputStream) {
+
+    fun importBeatFile(
+        projectId: Long,
+        originalName: String,
+        inputStream: InputStream
+    ) {
+
         viewModelScope.launch {
+
             _isLoading.value = true
-            _statusMessage.value = "Importuji a analyzuji instrumentální beat..."
+            _statusMessage.value =
+                "Importuji beat..."
+
 
             withContext(Dispatchers.IO) {
+
                 try {
-                    val project = repository.getProjectById(projectId) ?: return@withContext
-                    val projectDir = getProjectDir(projectId)
-                    if (!projectDir.exists()) projectDir.mkdirs()
 
-                    val finalBeatFile = File(projectDir, "${project.name}_BEAT.wav")
-                    if (finalBeatFile.exists()) finalBeatFile.delete()
+                    val project =
+                        repository.getProjectById(projectId)
+                            ?: return@withContext
 
-                    FileOutputStream(finalBeatFile).use { fos ->
-                        inputStream.copyTo(fos)
-                    }
 
-                    _statusMessage.value = "Detekuji přesné BPM instrumentálu..."
-                    val detectedBpm = AudioEngine.detectBPM(finalBeatFile)
+                    val dir =
+                        getProjectDir(projectId)
 
-                    val updatedProject = project.copy(
-                        beatFilePath = finalBeatFile.absolutePath,
-                        beatOriginalName = originalName,
-                        bpm = detectedBpm
-                    )
-                    repository.updateProject(updatedProject)
-                    _currentProject.value = updatedProject
-                    _statusMessage.value = "Beat úspěšně nahrán! BPM detekováno: $detectedBpm"
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed to import beat file", e)
-                    _statusMessage.value = "Chyba při importu beatu: ${e.message}"
-                } finally {
-                    _isLoading.value = false
-                }
-            }
-        }
-    }
+                    if (!dir.exists())
+                        dir.mkdirs()
 
-    /**
-     * Imports multiple vocal files selected from the device
-     */
-    fun importMultipleVocalFiles(projectId: Long, vocalStreams: List<Pair<String, InputStream>>) {
-        viewModelScope.launch {
-            _isLoading.value = true
-            _statusMessage.value = "Importuji ${vocalStreams.size} vokálních stop..."
 
-            withContext(Dispatchers.IO) {
-                try {
-                    val project = repository.getProjectById(projectId) ?: return@withContext
-                    val projectDir = getProjectDir(projectId)
-                    if (!projectDir.exists()) projectDir.mkdirs()
 
-                    var currentVocalNumber = _vocals.value.size
-
-                    for ((originalName, inputStream) in vocalStreams) {
-                        currentVocalNumber++
-                        val assignedName = "${project.name}_VOKAL$currentVocalNumber"
-
-                        val finalVocalFile = File(projectDir, "$assignedName.wav")
-                        if (finalVocalFile.exists()) finalVocalFile.delete()
-
-                        FileOutputStream(finalVocalFile).use { fos ->
-                            inputStream.copyTo(fos)
-                        }
-
-                        // Determine if major or minor double tracking
-                        var setAsMajor = true
-                        if (currentVocalNumber > 1) {
-                            val likelyDouble = originalName.lowercase().contains("double") ||
-                                               originalName.lowercase().contains("back") ||
-                                               currentVocalNumber > 1
-                            if (likelyDouble) {
-                                setAsMajor = false
-                            }
-                        }
-
-                        val vocalEntity = VocalFileEntity(
-                            projectId = projectId,
-                            filePath = finalVocalFile.absolutePath,
-                            originalName = originalName,
-                            assignedName = assignedName,
-                            isMajor = setAsMajor,
-                            volume = if (setAsMajor) 1.0f else 0.65f,
-                            panning = if (setAsMajor) 0.0f else -0.75f
+                    val extension =
+                        originalName.substringAfterLast(
+                            ".",
+                            "wav"
                         )
 
-                        repository.insertVocalFile(vocalEntity)
+
+                    val sourceFile =
+                        File(
+                            dir,
+                            "${project.name}_BEAT.$extension"
+                        )
+
+
+                    FileOutputStream(sourceFile)
+                        .use { output ->
+                            inputStream.copyTo(output)
+                        }
+
+
+
+                    val detectedBpm =
+                        if (extension.lowercase() == "wav") {
+                            AudioEngine.detectBPM(sourceFile)
+                        } else {
+                            project.bpm
+                        }
+
+
+
+                    val updated =
+                        project.copy(
+
+                            beatFilePath =
+                                sourceFile.absolutePath,
+
+                            beatOriginalName =
+                                originalName,
+
+                            bpm =
+                                detectedBpm
+                        )
+
+
+
+                    repository.updateProject(updated)
+
+                    _currentProject.value = updated
+
+
+                    _statusMessage.value =
+                        "Beat načten. BPM: $detectedBpm"
+
+
+                } catch(e: Exception) {
+
+                    Log.e(TAG,
+                        "Import beat failed",
+                        e
+                    )
+
+                    _statusMessage.value =
+                        "Chyba importu: ${e.message}"
+
+                } finally {
+
+                    _isLoading.value = false
+                }
+            }
+        }
+    }
+
+
+
+
+
+    fun importMultipleVocalFiles(
+        projectId: Long,
+        vocalStreams: List<Pair<String, InputStream>>
+    ) {
+
+
+        viewModelScope.launch {
+
+
+            _isLoading.value = true
+
+
+            withContext(Dispatchers.IO) {
+
+
+                try {
+
+
+                    val project =
+                        repository.getProjectById(projectId)
+                            ?: return@withContext
+
+
+
+                    val dir =
+                        getProjectDir(projectId)
+
+
+                    if (!dir.exists())
+                        dir.mkdirs()
+
+
+
+                    var number =
+                        _vocals.value.size
+
+
+
+                    vocalStreams.forEach { (name, stream) ->
+
+
+                        number++
+
+
+                        val file =
+                            File(
+                                dir,
+                                "${project.name}_VOKAL$number.wav"
+                            )
+
+
+
+                        FileOutputStream(file)
+                            .use {
+                                stream.copyTo(it)
+                            }
+
+
+
+                        val vocal =
+                            VocalFileEntity(
+
+                                projectId =
+                                    projectId,
+
+                                filePath =
+                                    file.absolutePath,
+
+                                originalName =
+                                    name,
+
+                                assignedName =
+                                    "${project.name}_VOKAL$number",
+
+                                isMajor =
+                                    number == 1,
+
+                                volume =
+                                    if(number == 1)
+                                        1f
+                                    else
+                                        0.65f,
+
+                                panning =
+                                    if(number == 1)
+                                        0f
+                                    else
+                                        -0.75f
+                            )
+
+
+
+                        repository.insertVocalFile(vocal)
+
                     }
 
-                    _statusMessage.value = "Úspěšně importováno ${vocalStreams.size} vokálních stop!"
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed to import vocals", e)
-                    _statusMessage.value = "Chyba při importu vokálů: ${e.message}"
+
+                    _statusMessage.value =
+                        "Vokály importovány"
+
+
+                } catch(e: Exception) {
+
+                    Log.e(TAG,
+                        "Import vocals failed",
+                        e
+                    )
+
+                    _statusMessage.value =
+                        "Chyba vokálu: ${e.message}"
+
+
                 } finally {
+
                     _isLoading.value = false
                 }
             }
         }
     }
-
-    /**
-     * Synthesizes and loads mock high-quality beat and vocal files for offline demonstration and testing.
-     */
-    fun createSyntheticProjectAssets(projectId: Long) {
-        viewModelScope.launch {
-            _isLoading.value = true
-            _statusMessage.value = "Generuji realistický beat a vokální stopy..."
-            
-            withContext(Dispatchers.IO) {
-                try {
-                    val project = repository.getProjectById(projectId) ?: return@withContext
-                    val projectDir = getProjectDir(projectId)
-                    if (!projectDir.exists()) projectDir.mkdirs()
-
-                    // 1. Generate Synthetic Beat WAV
-                    val beatFile = File(projectDir, "${project.name}_BEAT.wav")
-                    _statusMessage.value = "Generuji 90 BPM instrumentál s hlubokým sub-basem..."
-                    val bpm = AudioEngine.generateTestBeat(getApplication(), beatFile)
-
-                    val updatedProject = project.copy(
-                        beatFilePath = beatFile.absolutePath,
-                        beatOriginalName = "Vygenerovaný_Test_Beat.wav",
-                        bpm = bpm
-                    )
-                    repository.updateProject(updatedProject)
-                    _currentProject.value = updatedProject
-
-                    // 2. Generate Lead Vocal (Major)
-                    val leadVocalFile = File(projectDir, "${project.name}_VOKAL1.wav")
-                    _statusMessage.value = "Generuji hlavní rapový vokál (se šumem, brumem a sykavkami)..."
-                    AudioEngine.generateTestVocal(getApplication(), leadVocalFile)
-
-                    val leadVocal = VocalFileEntity(
-                        projectId = projectId,
-                        filePath = leadVocalFile.absolutePath,
-                        originalName = "Test_Vokal_Hlavni.wav",
-                        assignedName = "${project.name}_VOKAL1",
-                        isMajor = true,
-                        volume = 1.0f,
-                        panning = 0.0f
-                    )
-                    repository.insertVocalFile(leadVocal)
-
-                    // 3. Generate Backing Double Vocal (Minor)
-                    // Copy lead vocal to create a double backing track
-                    val backVocalFile = File(projectDir, "${project.name}_VOKAL2.wav")
-                    leadVocalFile.copyTo(backVocalFile, overwrite = true)
-
-                    val backVocal = VocalFileEntity(
-                        projectId = projectId,
-                        filePath = backVocalFile.absolutePath,
-                        originalName = "Test_Vokal_Double.wav",
-                        assignedName = "${project.name}_VOKAL2",
-                        isMajor = false,
-                        volume = 0.65f,
-                        panning = -0.75f, // Wide left
-                        offsetMs = 0      // Mixer will automatically add delayed offset for double tracking
-                    )
-                    repository.insertVocalFile(backVocal)
-
-                    _statusMessage.value = "Projekt úspěšně vygenerován s Lead & Backing vokály!"
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error generating synthetic assets", e)
-                    _statusMessage.value = "Chyba při generování: ${e.message}"
-                } finally {
-                    _isLoading.value = false
-                }
-            }
-        }
-    }
-
-    /**
-     * Saves vocal's settings and triggers processing in the background
-     */
+    
     fun saveAndProcessVocal(vocal: VocalFileEntity) {
-        viewModelScope.launch {
-            _isLoading.value = true
-            _statusMessage.value = "Zpracovávám efekty (Odšumování, Normalizace, Komprese)..."
-
-            withContext(Dispatchers.IO) {
-                try {
-                    repository.updateVocalFile(vocal)
-                    _currentVocal.value = vocal
-
-                    val inputFile = File(vocal.filePath)
-                    val projectDir = getProjectDir(vocal.projectId)
-                    val processedFile = File(projectDir, "${vocal.assignedName}_ZPRACOVANO.wav")
-
-                    if (processedFile.exists()) processedFile.delete()
-
-                    val success = AudioEngine.processVocal(inputFile, processedFile, vocal)
-                    if (success) {
-                        val updatedVocal = vocal.copy(processedFilePath = processedFile.absolutePath)
-                        repository.updateVocalFile(updatedVocal)
-                        _currentVocal.value = updatedVocal
-                        _statusMessage.value = "Vokální efekty byly úspěšně aplikovány!"
-                    } else {
-                        _statusMessage.value = "Některé efekty selhaly při zpracování."
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed processing vocal", e)
-                    _statusMessage.value = "Chyba při zpracování: ${e.message}"
-                } finally {
-                    _isLoading.value = false
-                }
-            }
-        }
-    }
-
-    /**
-     * Delete vocal file from project
-     */
-    fun deleteVocal(vocal: VocalFileEntity) {
-        viewModelScope.launch(Dispatchers.IO) {
-            val file = File(vocal.filePath)
-            if (file.exists()) file.delete()
-
-            vocal.processedFilePath?.let {
-                val procFile = File(it)
-                if (procFile.exists()) procFile.delete()
-            }
-
-            repository.deleteVocalFile(vocal)
-            _statusMessage.value = "Vokál ${vocal.assignedName} smazán."
-        }
-    }
-
-    /**
-     * Automatically aligns and mixes all vocals (major and minor doubles) with the beat track
-     */
-    fun mixActiveProject() {
-        val project = _currentProject.value ?: return
-        val vocalsList = _vocals.value
-        val beatPath = project.beatFilePath
-
-        if (beatPath == null) {
-            _statusMessage.value = "Chyba: Projekt neobsahuje žádný beat pro smíchání."
-            return
-        }
 
         viewModelScope.launch {
+
             _isLoading.value = true
-            _statusMessage.value = "Aplikuji Auto-EQ (notch filtr pro vokál) na beat a míchám stopy..."
+
+            _statusMessage.value =
+                "Zpracovávám vokál..."
+
 
             withContext(Dispatchers.IO) {
+
+
                 try {
-                    val beatFile = File(beatPath)
-                    val projectDir = getProjectDir(project.id)
-                    val mixedOutFile = File(projectDir, "${project.name}_MASTER_MIX.wav")
 
-                    // Map vocals to Pair of File and Vocal settings
-                    // Prefer using the fully processed/FX-applied vocal if available, otherwise fallback to original!
-                    val vocalPairs = vocalsList.map { vocal ->
-                        val activePath = vocal.processedFilePath ?: vocal.filePath
-                        Pair(File(activePath), vocal)
-                    }
+                    val input =
+                        File(vocal.filePath)
 
-                    if (vocalPairs.isEmpty()) {
-                        _statusMessage.value = "Chyba: Projekt neobsahuje žádné vokální stopy."
+
+                    if (!input.exists()) {
+
+                        _statusMessage.value =
+                            "Vstupní soubor neexistuje"
+
                         return@withContext
                     }
 
-                    val success = AudioEngine.mixProject(beatFile, vocalPairs, mixedOutFile)
-                    if (success) {
-                        val updatedProject = project.copy(mixedFilePath = mixedOutFile.absolutePath)
-                        repository.updateProject(updatedProject)
-                        _currentProject.value = updatedProject
-                        _statusMessage.value = "Master Mix byl úspěšně vygenerován!"
+
+
+                    repository.updateVocalFile(vocal)
+
+                    _currentVocal.value = vocal
+
+
+
+                    val output =
+                        File(
+                            getProjectDir(vocal.projectId),
+                            "${vocal.assignedName}_PROCESSED.wav"
+                        )
+
+
+
+                    if(output.exists())
+                        output.delete()
+
+
+
+                    AudioEngine.processVocal(
+                        input,
+                        output,
+                        vocal
+                    )
+
+
+
+                    if(output.exists()) {
+
+                        val updated =
+                            vocal.copy(
+                                filePath =
+                                    output.absolutePath
+                            )
+
+
+                        repository.updateVocalFile(updated)
+
+                        _currentVocal.value =
+                            updated
+
+
+                        _statusMessage.value =
+                            "Vokál zpracován"
+
                     } else {
-                        _statusMessage.value = "Míchání stop se nezdařilo."
+
+                        _statusMessage.value =
+                            "Export selhal"
                     }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Mixing failed", e)
-                    _statusMessage.value = "Chyba při míchání: ${e.message}"
+
+
+
+                } catch(e: Exception) {
+
+
+                    Log.e(
+                        TAG,
+                        "Processing error",
+                        e
+                    )
+
+
+                    _statusMessage.value =
+                        "Chyba zpracování: ${e.message}"
+
                 } finally {
+
                     _isLoading.value = false
                 }
             }
         }
     }
 
-    // Media Playback Implementation
-    fun playAudio(filePath: String) {
-        if (_isPlaying.value && _playingPath.value == filePath) {
-            pauseAudio()
-            return
-        }
 
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                withContext(Dispatchers.Main) {
-                    stopAudio()
-                }
 
-                val player = MediaPlayer().apply {
-                    setDataSource(filePath)
-                    prepare()
-                    start()
-                    setOnCompletionListener {
-                        _isPlaying.value = false
-                        _playingPath.value = null
+
+    fun playAudio(path: String) {
+
+
+        stopAudio()
+
+
+
+        try {
+
+
+            val file =
+                File(path)
+
+
+            if(!file.exists()) {
+
+                _statusMessage.value =
+                    "Soubor nenalezen"
+
+                return
+            }
+
+
+
+            mediaPlayer =
+                MediaPlayer().apply {
+
+
+                    setDataSource(
+                        file.absolutePath
+                    )
+
+
+                    setOnPreparedListener {
+
+                        start()
+
+                        _isPlaying.value =
+                            true
+
+                        _playingPath.value =
+                            path
                     }
+
+
+
+                    setOnCompletionListener {
+
+                        _isPlaying.value =
+                            false
+
+                        _playingPath.value =
+                            null
+
+                        release()
+
+                        mediaPlayer = null
+                    }
+
+
+
+                    setOnErrorListener { _, _, _ ->
+
+
+                        _isPlaying.value =
+                            false
+
+
+                        _playingPath.value =
+                            null
+
+
+                        release()
+
+                        mediaPlayer = null
+
+
+                        true
+                    }
+
+
+
+                    prepareAsync()
                 }
 
-                mediaPlayer = player
-                _isPlaying.value = true
-                _playingPath.value = filePath
-            } catch (e: Exception) {
-                Log.e(TAG, "MediaPlayer failed to play: $filePath", e)
-                _statusMessage.value = "Chyba přehrávání: Soubor nelze přehrát."
-            }
+
+
+        } catch(e: Exception) {
+
+
+            Log.e(
+                TAG,
+                "Playback error",
+                e
+            )
+
+
+            _statusMessage.value =
+                "Nelze přehrát: ${e.message}"
+
         }
     }
 
-    fun pauseAudio() {
-        mediaPlayer?.let { player ->
-            if (player.isPlaying) {
-                player.pause()
-                _isPlaying.value = false
-            } else {
-                player.start()
-                _isPlaying.value = true
-            }
-        }
-    }
+
+
+
 
     fun stopAudio() {
-        mediaPlayer?.let {
-            try {
-                if (it.isPlaying) {
+
+
+        try {
+
+
+            mediaPlayer?.let {
+
+
+                if(it.isPlaying)
                     it.stop()
-                }
+
+
                 it.release()
-            } catch (e: Exception) {
-                Log.e(TAG, "Error stopping media player", e)
+            }
+
+
+        } catch(_: Exception) {
+
+
+        } finally {
+
+
+            mediaPlayer = null
+
+            _isPlaying.value =
+                false
+
+            _playingPath.value =
+                null
+        }
+    }
+
+
+
+
+    fun loadWaveform(
+        filePath: String,
+        bars: Int = 50
+    ) {
+
+
+        if(waveformCache.containsKey(filePath))
+            return
+
+
+
+        viewModelScope.launch(Dispatchers.IO) {
+
+
+            val file =
+                File(filePath)
+
+
+
+            if(file.exists()) {
+
+
+                AudioEngine
+                    .extractWaveform(
+                        file,
+                        bars
+                    )
+                    ?.let {
+
+
+                        waveformCache[filePath] =
+                            it
+
+                    }
             }
         }
-        mediaPlayer = null
-        _isPlaying.value = false
-        _playingPath.value = null
+    }
+        fun getWaveform(
+        path: String
+    ): FloatArray {
+
+        return waveformCache[path]
+            ?: FloatArray(0)
     }
 
-    private fun getProjectDir(projectId: Long): File {
-        val rootDir = getApplication<Application>().filesDir
-        return File(rootDir, "projects/$projectId")
+
+
+
+    fun mixActiveProject(
+        projectId: Long
+    ) {
+
+
+        viewModelScope.launch {
+
+
+            _isLoading.value = true
+
+            _statusMessage.value =
+                "Míchám projekt..."
+
+
+
+            withContext(Dispatchers.IO) {
+
+
+                try {
+
+
+                    val project =
+                        repository.getProjectById(
+                            projectId
+                        )
+
+
+                    if(project == null) {
+
+                        _statusMessage.value =
+                            "Projekt nenalezen"
+
+                        return@withContext
+                    }
+
+
+
+                    val beat =
+                        project.beatFilePath
+                            ?.let {
+                                File(it)
+                            }
+
+
+
+                    val vocals =
+                        repository
+                            .getVocalsList(projectId)
+                            .map {
+                                File(it.filePath)
+                            }
+
+
+
+                    if(beat == null || !beat.exists()) {
+
+                        _statusMessage.value =
+                            "Chybí beat"
+
+                        return@withContext
+                    }
+
+
+
+                    val output =
+                        File(
+                            getProjectDir(projectId),
+                            "${project.name}_MASTER.wav"
+                        )
+
+
+
+                    if(output.exists())
+                        output.delete()
+
+
+
+                    AudioEngine.mixProject(
+                        beat,
+                        vocals,
+                        output
+                    )
+
+
+
+                    if(output.exists()) {
+
+                        _statusMessage.value =
+                            "Master export hotový"
+
+                    } else {
+
+                        _statusMessage.value =
+                            "Master export selhal"
+                    }
+
+
+
+                } catch(e: Exception) {
+
+
+                    Log.e(
+                        TAG,
+                        "Mix error",
+                        e
+                    )
+
+
+                    _statusMessage.value =
+                        "Chyba mixu: ${e.message}"
+
+                } finally {
+
+                    _isLoading.value = false
+                }
+            }
+        }
     }
+
+
+
+
+
+    private fun getProjectDir(
+        projectId: Long
+    ): File {
+
+
+        return File(
+            getApplication<Application>()
+                .filesDir,
+
+            "projects/$projectId"
+        )
+    }
+
+
+
 
     override fun onCleared() {
-        super.onCleared()
+
         stopAudio()
+
+        super.onCleared()
     }
 }
