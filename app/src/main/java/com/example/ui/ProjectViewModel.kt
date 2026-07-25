@@ -95,18 +95,20 @@ class ProjectViewModel(application: Application) : AndroidViewModel(application)
 
     private suspend fun loadProjectDetails(id: Long) {
 
-        val project = repository.getProjectById(id)
+    val project = repository.getProjectById(id)
 
-        _currentProject.value = project
+    _currentProject.value = project
 
-        project?.let {
+    if(project != null) {
 
-            repository.getVocalsForProject(id)
-                .collect { list ->
-                    _vocals.value = list
-                }
-        }
+        repository.getVocalsForProject(id)
+            .collectLatest { list ->
+
+                _vocals.value = list
+
+            }
     }
+}
 
 
     private suspend fun loadVocalDetails(id: Long) {
@@ -114,7 +116,6 @@ class ProjectViewModel(application: Application) : AndroidViewModel(application)
         _currentVocal.value =
             repository.getVocalById(id)
     }
-    
     fun clearStatusMessage() {
         _statusMessage.value = null
     }
@@ -209,8 +210,8 @@ class ProjectViewModel(application: Application) : AndroidViewModel(application)
 
                     val sourceFile =
                         File(
-                            dir,
-                            "${project.name}_BEAT.$extension"
+                        dir,
+                       "${project.name}_BEAT.wav"
                         )
 
 
@@ -395,7 +396,6 @@ class ProjectViewModel(application: Application) : AndroidViewModel(application)
             }
         }
     }
-    
     fun saveAndProcessVocal(vocal: VocalFileEntity) {
 
         viewModelScope.launch {
@@ -682,7 +682,7 @@ class ProjectViewModel(application: Application) : AndroidViewModel(application)
             }
         }
     }
-        fun getWaveform(
+    fun getWaveform(
         path: String
     ): FloatArray {
 
@@ -739,11 +739,12 @@ class ProjectViewModel(application: Application) : AndroidViewModel(application)
 
 
                     val vocals =
-                        repository
-                            .getVocalsList(projectId)
-                            .map {
-                                File(it.filePath)
-                            }
+                       repository
+                        .getVocalsForProject(projectId)
+                         .first()
+                          .map {
+                            File(it.filePath)
+                           }
 
 
 
