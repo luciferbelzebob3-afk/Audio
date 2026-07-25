@@ -814,7 +814,157 @@ class ProjectViewModel(application: Application) : AndroidViewModel(application)
     }
 
 
+private val _waveformState =
+    MutableStateFlow<FloatArray?>(null)
 
+val waveformState =
+    _waveformState.asStateFlow()
+
+
+
+fun updateProjectBpm(
+    projectId: Long,
+    bpm: Int
+) {
+
+    viewModelScope.launch(Dispatchers.IO) {
+
+        val project =
+            repository.getProjectById(projectId)
+                ?: return@launch
+
+
+        val updated =
+            project.copy(
+                bpm = bpm
+            )
+
+
+        repository.updateProject(updated)
+
+
+        withContext(Dispatchers.Main) {
+            _currentProject.value = updated
+        }
+    }
+}
+
+
+
+fun deleteVocal(
+    vocal: VocalFileEntity
+) {
+
+    viewModelScope.launch(Dispatchers.IO) {
+
+        try {
+
+            File(vocal.filePath)
+                .delete()
+
+
+            repository.deleteVocalFile(vocal)
+
+
+        } catch(e: Exception) {
+
+            Log.e(
+                TAG,
+                "Delete vocal error",
+                e
+            )
+        }
+    }
+}
+
+
+
+
+fun createSyntheticProjectAssets(
+    projectId: Long
+) {
+
+    viewModelScope.launch(Dispatchers.IO) {
+
+        val project =
+            repository.getProjectById(projectId)
+                ?: return@launch
+
+
+        val dir =
+            getProjectDir(projectId)
+
+
+        if(!dir.exists())
+            dir.mkdirs()
+
+
+
+        val beat =
+            File(
+                dir,
+                "${project.name}_TEST_BEAT.wav"
+            )
+
+
+        val vocal =
+            File(
+                dir,
+                "${project.name}_TEST_VOCAL.wav"
+            )
+
+
+
+        AudioEngine.generateTestBeat(
+            beat
+        )
+
+
+        AudioEngine.generateTestVocal(
+            vocal
+        )
+
+
+
+        repository.updateProject(
+            project.copy(
+                beatFilePath =
+                    beat.absolutePath
+            )
+        )
+
+
+        _statusMessage.value =
+            "Test audio vytvořen"
+    }
+}
+
+
+
+
+fun updateWaveform(
+    path: String
+) {
+
+    viewModelScope.launch(Dispatchers.IO) {
+
+        val file =
+            File(path)
+
+
+        val waveform =
+            AudioEngine.extractWaveform(
+                file
+            )
+
+
+        withContext(Dispatchers.Main) {
+
+            _waveformState.value =
+                waveform
+        }
+    }
+}
 
 
     private fun getProjectDir(
