@@ -50,8 +50,8 @@ fun detectBPM(file: File): Int {
 
 
         val bpm =
-            (44100 * 60 / avgDistance)
-                .toInt()
+    (44100.0 * 60.0 / avgDistance)
+        .toInt()
 
 
         bpm.coerceIn(50, 200)
