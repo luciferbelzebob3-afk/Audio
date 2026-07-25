@@ -852,6 +852,7 @@ fun updateProjectBpm(
 
 
 fun deleteVocal(
+    projectId: Long,
     vocal: VocalFileEntity
 ) {
 
