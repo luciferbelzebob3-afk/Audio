@@ -815,16 +815,15 @@ class ProjectViewModel(application: Application) : AndroidViewModel(application)
 
 
 private val _waveformState =
-    MutableStateFlow<FloatArray>(FloatArray(0))
+    MutableStateFlow<FloatArray?>(null)
 
 val waveformState =
     _waveformState.asStateFlow()
 
 
-
 fun updateProjectBpm(
     projectId: Long,
-    bpm: Int
+    bpm: Double
 ) {
 
     viewModelScope.launch(Dispatchers.IO) {
@@ -836,7 +835,7 @@ fun updateProjectBpm(
 
         val updated =
             project.copy(
-                bpm = bpm
+                bpm = bpm.toInt()
             )
 
 
@@ -852,19 +851,17 @@ fun updateProjectBpm(
 
 
 fun deleteVocal(
-    projectId: Long,
     vocal: VocalFileEntity
 ) {
 
     viewModelScope.launch(Dispatchers.IO) {
 
-        try {
+        File(vocal.filePath)
+            .delete()
 
-            File(vocal.filePath)
-                .delete()
-
-
-            repository.deleteVocalFile(vocal)
+        repository.deleteVocalFile(vocal)
+    }
+}
 
 
         } catch(e: Exception) {
@@ -953,8 +950,6 @@ fun updateWaveform(
             AudioEngine.extractWaveform(
                 File(path)
             )
-            ?: FloatArray(0)
-
 
         withContext(Dispatchers.Main) {
 
