@@ -54,7 +54,7 @@ fun detectBPM(file: File): Int {
         .toInt()
 
 
-        bpm.coerceIn(50.0, 200.0)
+        bpm.coerceIn(50.0, 200.0).toInt()
 
 
     } catch (e: Exception) {
