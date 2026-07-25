@@ -244,7 +244,7 @@ class ProjectViewModel(application: Application) : AndroidViewModel(application)
                                 originalName,
 
                             bpm =
-                                detectedBpm
+                                detectedBpm.toDouble()
                         )
 
 
@@ -745,11 +745,11 @@ class ProjectViewModel(application: Application) : AndroidViewModel(application)
 
                     val vocals =
                        repository
-                        .getVocalsForProject(projectId)
-                         .first()
-                          .map {
-                            File(it.filePath)
-                           }
+                         .getVocalsForProject(projectId)
+                          .first()
+                           .map {
+                             File(it.filePath)
+                            }
 
 
 
@@ -833,7 +833,7 @@ class ProjectViewModel(application: Application) : AndroidViewModel(application)
 
             val updated =
                 project.copy(
-                    bpm = bpm.toInt()
+                    bpm = bpm
                 )
 
 
