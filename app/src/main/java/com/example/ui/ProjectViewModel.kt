@@ -815,7 +815,7 @@ class ProjectViewModel(application: Application) : AndroidViewModel(application)
 
 
 private val _waveformState =
-    MutableStateFlow<FloatArray?>(null)
+    MutableStateFlow<FloatArray>(FloatArray(0))
 
 val waveformState =
     _waveformState.asStateFlow()
@@ -948,14 +948,11 @@ fun updateWaveform(
 
     viewModelScope.launch(Dispatchers.IO) {
 
-        val file =
-            File(path)
-
-
         val waveform =
             AudioEngine.extractWaveform(
-                file
+                File(path)
             )
+            ?: FloatArray(0)
 
 
         withContext(Dispatchers.Main) {
@@ -965,7 +962,6 @@ fun updateWaveform(
         }
     }
 }
-
 
     private fun getProjectDir(
         projectId: Long
