@@ -9,6 +9,12 @@ import java.io.InputStream
 import com.example.data.ProjectEntity
 import com.example.data.VocalFileEntity
 
+sealed class Screen {
+    object Dashboard : Screen()
+    data class ProjectWorkspace(val projectId: Long) : Screen()
+    data class VocalProcessor(val projectId: Long, val vocalFileId: Long) : Screen()
+}
+
 /**
  * Minimal ProjectViewModel stub to satisfy UI imports and provide compile-time
  * accessible StateFlow properties and no-op implementations for functions used
