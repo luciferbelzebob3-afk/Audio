@@ -15,10 +15,10 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
 
-sealed interface Screen {
-    object Dashboard : Screen
-    data class ProjectWorkspace(val projectId: Long) : Screen
-    data class VocalProcessor(val projectId: Long, val vocalFileId: Long) : Screen
+sealed class Screen {
+    object Dashboard : Screen()
+    data class ProjectWorkspace(val projectId: Long) : Screen()
+    data class VocalProcessor(val projectId: Long, val vocalFileId: Long) : Screen()
 }
 
 class ProjectViewModel(application: Application) : AndroidViewModel(application) {
@@ -36,7 +36,7 @@ class ProjectViewModel(application: Application) : AndroidViewModel(application)
         )
 
     private val _currentScreen = MutableStateFlow<Screen>(Screen.Dashboard)
-    val currentScreen = _currentScreen.asStateFlow()
+    val currentScreen: StateFlow<Screen> = _currentScreen.asStateFlow()
 
     private val _currentProject = MutableStateFlow<ProjectEntity?>(null)
     val currentProject = _currentProject.asStateFlow()
